@@ -229,11 +229,15 @@ using System;
 using System.Runtime.InteropServices;
 public static class WWInput {
     [StructLayout(LayoutKind.Sequential)]
-    struct INPUT { public uint type; public InputUnion U; }
-    [StructLayout(LayoutKind.Explicit)]
-    struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; }
+    struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [StructLayout(LayoutKind.Sequential)]
     struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct HARDWAREINPUT { public uint uMsg; public ushort wParamL; public ushort wParamH; }
+    [StructLayout(LayoutKind.Explicit)]
+    struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public HARDWAREINPUT hi; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT { public uint type; public InputUnion U; }
     [DllImport("user32.dll", SetLastError=true)]
     static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     const uint INPUT_KEYBOARD = 1; const uint KEYEVENTF_KEYUP = 2;
@@ -241,9 +245,10 @@ public static class WWInput {
     static INPUT Key(ushort vk, bool up) {
         return new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0 } } };
     }
-    public static void CtrlV() {
+    public static int InputStructSize() { return Marshal.SizeOf(typeof(INPUT)); }
+    public static uint CtrlV() {
         INPUT[] seq = new INPUT[] { Key(VK_CONTROL,false), Key(VK_V,false), Key(VK_V,true), Key(VK_CONTROL,true) };
-        SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT)));
+        return SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT)));
     }
 }
 '@
@@ -252,7 +257,8 @@ if (-not ('WWInput' -as [type])) { Add-Type -TypeDefinition $script:SendInput }
 function Send-CtrlV {
     [CmdletBinding()]
     param()
-    [WWInput]::CtrlV()
+    $sent = [WWInput]::CtrlV()
+    if ($sent -ne 4) { throw "SendInput injected $sent of 4 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
 }
 
 Export-ModuleMember -Function *

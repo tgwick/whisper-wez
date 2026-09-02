@@ -262,3 +262,10 @@ Describe 'Clipboard primitives' {
         (Set-ClipboardTextSafe -Text '') | Should -BeTrue
     }
 }
+
+Describe 'SendInput INPUT struct ABI size' {
+    It 'INPUT marshals to the native size for this architecture' {
+        $expected = if ([Environment]::Is64BitProcess) { 40 } else { 28 }
+        [WWInput]::InputStructSize() | Should -Be $expected
+    }
+}
