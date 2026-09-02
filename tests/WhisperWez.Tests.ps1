@@ -251,3 +251,14 @@ Describe 'Get-ForegroundProcessName (smoke)' {
         { Get-ForegroundProcessName } | Should -Not -Throw
     }
 }
+
+Describe 'Clipboard primitives' {
+    It 'round-trips clipboard text' {
+        $marker = 'WW_TEST_' + [guid]::NewGuid()
+        (Set-ClipboardTextSafe -Text $marker) | Should -BeTrue
+        Get-ClipboardTextSafe | Should -Be $marker
+    }
+    It 'Set-ClipboardTextSafe handles empty string' {
+        (Set-ClipboardTextSafe -Text '') | Should -BeTrue
+    }
+}

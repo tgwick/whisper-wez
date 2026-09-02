@@ -205,4 +205,54 @@ function Test-TargetFocused {
     (Get-ForegroundProcessName) -eq $TargetApp
 }
 
+function Get-ClipboardTextSafe {
+    [CmdletBinding()]
+    param()
+    try {
+        $t = Get-Clipboard -Raw -ErrorAction Stop
+        if ($null -eq $t) { '' } else { [string]$t }
+    } catch { '' }
+}
+
+function Set-ClipboardTextSafe {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    try {
+        if ([string]::IsNullOrEmpty($Text)) { Set-Clipboard -Value ' ' } # Set-Clipboard rejects empty
+        else { Set-Clipboard -Value $Text }
+        $true
+    } catch { $false }
+}
+
+$script:SendInput = @'
+using System;
+using System.Runtime.InteropServices;
+public static class WWInput {
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT { public uint type; public InputUnion U; }
+    [StructLayout(LayoutKind.Explicit)]
+    struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    const uint INPUT_KEYBOARD = 1; const uint KEYEVENTF_KEYUP = 2;
+    const ushort VK_CONTROL = 0x11; const ushort VK_V = 0x56;
+    static INPUT Key(ushort vk, bool up) {
+        return new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0 } } };
+    }
+    public static void CtrlV() {
+        INPUT[] seq = new INPUT[] { Key(VK_CONTROL,false), Key(VK_V,false), Key(VK_V,true), Key(VK_CONTROL,true) };
+        SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+'@
+if (-not ('WWInput' -as [type])) { Add-Type -TypeDefinition $script:SendInput }
+
+function Send-CtrlV {
+    [CmdletBinding()]
+    param()
+    [WWInput]::CtrlV()
+}
+
 Export-ModuleMember -Function *
