@@ -301,3 +301,19 @@ Describe 'Invoke-Injection' {
         Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 0 -Exactly
     }
 }
+
+Describe 'Write-WhisperWezLog' {
+    It 'appends a timestamped, leveled line' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.log')
+        Write-WhisperWezLog -LogFile $f -Message 'hello' -Level 'INFO'
+        (Get-Content $f) | Should -Match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[INFO\] hello$'
+        Remove-Item $f -Force
+    }
+    It 'rolls the file when oversized' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.log')
+        Set-Content -Path $f -Value ('x' * 10)
+        Write-WhisperWezLog -LogFile $f -Message 'after' -MaxBytes 5
+        Test-Path "$f.1" | Should -BeTrue
+        Remove-Item $f, "$f.1" -Force -ErrorAction SilentlyContinue
+    }
+}
