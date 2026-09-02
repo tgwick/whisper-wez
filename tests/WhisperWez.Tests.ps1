@@ -14,7 +14,7 @@ Describe 'Get-WhisperWezConfig' {
         $c = Get-WhisperWezConfig
         $c.TargetApp              | Should -Be 'wezterm-gui'
         $c.PollMs                 | Should -Be 400
-        $c.RestoreClipboard       | Should -BeTrue
+        $c.RestoreClipboard       | Should -BeFalse
         $c.MaxRecentIds           | Should -Be 50
         $c.ClipboardRestoreDelayMs| Should -Be 300
         $c.DbPath                 | Should -Match 'flow\.sqlite$'

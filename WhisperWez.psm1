@@ -24,7 +24,7 @@ function Get-WhisperWezConfig {
         DbPath                  = Join-Path $env:APPDATA 'Wispr Flow\flow.sqlite'
         TargetApp               = 'wezterm-gui'
         PollMs                  = 400
-        RestoreClipboard        = $true
+        RestoreClipboard        = $false
         ClipboardRestoreDelayMs = 300
         MaxRecentIds            = 50
         StateFile               = Join-Path $root 'state.json'
