@@ -292,17 +292,18 @@ function Invoke-Injection {
 function Write-WhisperWezLog {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$LogFile,
-        [Parameter(Mandatory)][string]$Message,
+        [string]$LogFile,
+        [string]$Message = '',
         [string]$Level = 'INFO',
         [int]$MaxBytes = 5MB
     )
+    if ([string]::IsNullOrEmpty($LogFile)) { return }  # can't log without a path; return silently rather than throw
     try {
-        if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt $MaxBytes)) {
-            Move-Item -Path $LogFile -Destination "$LogFile.1" -Force
+        if ((Test-Path -LiteralPath $LogFile) -and ((Get-Item -LiteralPath $LogFile).Length -gt $MaxBytes)) {
+            Move-Item -LiteralPath $LogFile -Destination "$LogFile.1" -Force
         }
         $line = "{0} [{1}] {2}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
-        Add-Content -Path $LogFile -Value $line -Encoding UTF8
+        Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
     } catch { }  # logging must never crash the loop
 }
 

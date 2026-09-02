@@ -311,9 +311,16 @@ Describe 'Write-WhisperWezLog' {
     }
     It 'rolls the file when oversized' {
         $f = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.log')
-        Set-Content -Path $f -Value ('x' * 10)
+        $original = 'x' * 10
+        Set-Content -Path $f -Value $original
         Write-WhisperWezLog -LogFile $f -Message 'after' -MaxBytes 5
         Test-Path "$f.1" | Should -BeTrue
+        (Get-Content "$f.1") | Should -Be $original
+        (Get-Content $f) | Should -Match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[INFO\] after$'
         Remove-Item $f, "$f.1" -Force -ErrorAction SilentlyContinue
+    }
+    It 'never throws on empty or null LogFile/Message' {
+        { Write-WhisperWezLog -LogFile '' -Message '' } | Should -Not -Throw
+        { Write-WhisperWezLog -LogFile $null -Message $null } | Should -Not -Throw
     }
 }
