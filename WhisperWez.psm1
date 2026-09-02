@@ -140,4 +140,40 @@ function Get-DbMaxTimestamp {
     [string]$rows[0].MaxTs
 }
 
+function New-WhisperWezState {
+    [CmdletBinding()]
+    param([string]$Now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+    [pscustomobject]@{ LastTimestamp = $Now; RecentIds = @() }
+}
+
+function Get-WhisperWezState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$StateFile)
+    if (-not (Test-Path $StateFile)) { return $null }
+    $o = Get-Content -Raw -Path $StateFile | ConvertFrom-Json
+    [pscustomobject]@{ LastTimestamp = $o.LastTimestamp; RecentIds = @($o.RecentIds) }
+}
+
+function Save-WhisperWezState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$StateFile, [Parameter(Mandatory)]$State)
+    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $StateFile -Encoding UTF8
+}
+
+function Test-TranscriptProcessed {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)]$Row)
+    @($State.RecentIds) -contains $Row.Id
+}
+
+function Update-WhisperWezState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)]$Row, [int]$MaxRecentIds = 50)
+    $last = $State.LastTimestamp
+    if ([string]::Compare($Row.Timestamp, $last) -gt 0) { $last = $Row.Timestamp }
+    $ids = @($State.RecentIds) + $Row.Id
+    if ($ids.Count -gt $MaxRecentIds) { $ids = $ids[($ids.Count - $MaxRecentIds)..($ids.Count - 1)] }
+    [pscustomobject]@{ LastTimestamp = $last; RecentIds = $ids }
+}
+
 Export-ModuleMember -Function *

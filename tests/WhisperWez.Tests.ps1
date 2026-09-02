@@ -158,3 +158,47 @@ INSERT INTO History VALUES ('sp1','2026-09-02 10:00:00.100 +00:00','wezterm-gui'
         ($rows | Where-Object Id -eq 'sp1').Text | Should -Be 'space path works'
     }
 }
+
+Describe 'WhisperWez state' {
+    It 'New-WhisperWezState starts empty at the given time' {
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        $s.LastTimestamp | Should -Be '2026-09-02 12:00:00'
+        @($s.RecentIds).Count | Should -Be 0
+    }
+    It 'Get-WhisperWezState returns null when file is absent' {
+        Get-WhisperWezState -StateFile (Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid())) | Should -BeNullOrEmpty
+    }
+    It 'Save/Get round-trips' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.json')
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        Save-WhisperWezState -StateFile $f -State $s
+        (Get-WhisperWezState -StateFile $f).LastTimestamp | Should -Be '2026-09-02 12:00:00'
+        Remove-Item $f -Force
+    }
+    It 'Update advances timestamp and records id' {
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        $row = [pscustomobject]@{ Id='a'; Timestamp='2026-09-02 12:00:05'; Text='x' }
+        $s2 = Update-WhisperWezState -State $s -Row $row
+        $s2.LastTimestamp | Should -Be '2026-09-02 12:00:05'
+        $s2.RecentIds | Should -Contain 'a'
+    }
+    It 'Update keeps the larger timestamp when row is older' {
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:10'
+        $row = [pscustomobject]@{ Id='b'; Timestamp='2026-09-02 12:00:05'; Text='x' }
+        (Update-WhisperWezState -State $s -Row $row).LastTimestamp | Should -Be '2026-09-02 12:00:10'
+    }
+    It 'Update trims RecentIds to MaxRecentIds' {
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        1..5 | ForEach-Object {
+            $s = Update-WhisperWezState -State $s -Row ([pscustomobject]@{ Id="id$_"; Timestamp='2026-09-02 12:00:00'; Text='x' }) -MaxRecentIds 3
+        }
+        @($s.RecentIds).Count | Should -Be 3
+        $s.RecentIds | Should -Be @('id3','id4','id5')
+    }
+    It 'Test-TranscriptProcessed detects a known id' {
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        $s = Update-WhisperWezState -State $s -Row ([pscustomobject]@{ Id='seen'; Timestamp='2026-09-02 12:00:00'; Text='x' })
+        Test-TranscriptProcessed -State $s -Row ([pscustomobject]@{ Id='seen' })  | Should -BeTrue
+        Test-TranscriptProcessed -State $s -Row ([pscustomobject]@{ Id='new' })   | Should -BeFalse
+    }
+}
