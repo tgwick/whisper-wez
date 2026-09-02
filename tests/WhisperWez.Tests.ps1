@@ -324,3 +324,45 @@ Describe 'Write-WhisperWezLog' {
         { Write-WhisperWezLog -LogFile $null -Message $null } | Should -Not -Throw
     }
 }
+
+Describe 'Start-WhisperWez -Once' {
+    BeforeEach {
+        $script:stateFile = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.json')
+        $script:cfg = Get-WhisperWezConfig -Overrides @{
+            StateFile   = $script:stateFile
+            LogFile     = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.log')
+            Sqlite3Path = 'sqlite3'
+            DbPath      = 'C:\nonexistent\flow.sqlite'
+        }
+        Mock -ModuleName WhisperWez Invoke-Injection { [pscustomobject]@{ Action='pasted'; Focused=$true } }
+        Mock -ModuleName WhisperWez Write-WhisperWezLog {}
+        Mock -ModuleName WhisperWez Get-DbMaxTimestamp { '2026-09-02 12:00:00.000 +00:00' }
+    }
+    AfterEach { Remove-Item $script:stateFile -Force -ErrorAction SilentlyContinue }
+
+    It 'injects each new transcript once and advances state' {
+        Mock -ModuleName WhisperWez Read-NewTranscripts {
+            @(
+                [pscustomobject]@{ Id='r1'; Timestamp='2026-09-02 13:00:00'; Text='one' },
+                [pscustomobject]@{ Id='r2'; Timestamp='2026-09-02 13:00:01'; Text='two' }
+            )
+        }
+        Start-WhisperWez -Config $script:cfg -Once
+        Should -Invoke -ModuleName WhisperWez Invoke-Injection -Times 2 -Exactly
+        (Get-WhisperWezState -StateFile $script:stateFile).RecentIds | Should -Contain 'r2'
+    }
+
+    It 'does not re-inject an already-processed transcript on the next poll' {
+        Mock -ModuleName WhisperWez Read-NewTranscripts {
+            @([pscustomobject]@{ Id='r1'; Timestamp='2026-09-02 13:00:00'; Text='one' })
+        }
+        Start-WhisperWez -Config $script:cfg -Once   # processes r1
+        Start-WhisperWez -Config $script:cfg -Once   # r1 already in RecentIds
+        Should -Invoke -ModuleName WhisperWez Invoke-Injection -Times 1 -Exactly
+    }
+
+    It 'survives a DB read error without throwing' {
+        Mock -ModuleName WhisperWez Read-NewTranscripts { throw 'db locked' }
+        { Start-WhisperWez -Config $script:cfg -Once } | Should -Not -Throw
+    }
+}

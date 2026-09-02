@@ -307,4 +307,48 @@ function Write-WhisperWezLog {
     } catch { }  # logging must never crash the loop
 }
 
+function Start-WhisperWez {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Config,
+        [switch]$DryRun,
+        [switch]$Once
+    )
+    $state = $null
+
+    do {
+        try {
+            if ($null -eq $state) {
+                $existing = Get-WhisperWezState -StateFile $Config.StateFile
+                if ($null -ne $existing) {
+                    $state = $existing
+                } else {
+                    # Seed from the DB's own clock/format (UTC) so timestamp comparisons are
+                    # apples-to-apples. This must happen INSIDE the try: Get-DbMaxTimestamp
+                    # throws on a real DB failure (missing DB/table, corrupt file), and a
+                    # startup DB error should be logged and retried next tick, not crash the loop.
+                    $seed = Get-DbMaxTimestamp -DbPath $Config.DbPath -Sqlite3Path $Config.Sqlite3Path
+                    $state = New-WhisperWezState -Now $seed
+                    Save-WhisperWezState -StateFile $Config.StateFile -State $state
+                    Write-WhisperWezLog -LogFile $Config.LogFile -Message "Initialized high-water mark at '$seed'"
+                }
+            }
+
+            $rows = Read-NewTranscripts -DbPath $Config.DbPath -Sqlite3Path $Config.Sqlite3Path `
+                        -TargetApp $Config.TargetApp -SinceTimestamp $state.LastTimestamp
+            foreach ($row in @($rows)) {
+                if (Test-TranscriptProcessed -State $state -Row $row) { continue }
+                $result = Invoke-Injection -Text $row.Text -Config $Config -DryRun:$DryRun
+                $state = Update-WhisperWezState -State $state -Row $row -MaxRecentIds $Config.MaxRecentIds
+                Save-WhisperWezState -StateFile $Config.StateFile -State $state
+                Write-WhisperWezLog -LogFile $Config.LogFile `
+                    -Message ("{0} chars -> {1} (focused={2}) id={3}" -f $row.Text.Length, $result.Action, $result.Focused, $row.Id)
+            }
+        } catch {
+            Write-WhisperWezLog -LogFile $Config.LogFile -Level 'ERROR' -Message $_.Exception.Message
+        }
+        if (-not $Once) { Start-Sleep -Milliseconds $Config.PollMs }
+    } while (-not $Once)
+}
+
 Export-ModuleMember -Function *
