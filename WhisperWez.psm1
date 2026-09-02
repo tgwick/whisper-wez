@@ -62,16 +62,24 @@ WHERE app = $app
   AND COALESCE(NULLIF(formattedText,''), NULLIF(asrText,'')) IS NOT NULL
 ORDER BY timestamp ASC;
 "@
-    # Materialize into a variable before piping: Invoke-Sqlite has its own internal
-    # pipeline ($Sql | & $Sqlite3Path ...), and calling it unparenthesized as the head
-    # of this outer `| ForEach-Object` causes PowerShell 5.1 to bind the outer $_ to
-    # the *entire* result array in one pass (so $_.Id / $_.Text become arrays of all
-    # values) instead of streaming one row per iteration. Assigning to $dbRows first
-    # avoids that nested-pipeline $_ scoping bug.
+    # Materialize rows into a variable before iterating: this makes the query execute
+    # and get parsed exactly once, and keeps each row's shape explicit for the loop body.
     $dbRows = Invoke-Sqlite -Sqlite3Path $Sqlite3Path -DbPath $DbPath -Sql $sql
     $dbRows | ForEach-Object {
         [pscustomobject]@{ Id = $_.Id; Timestamp = $_.Timestamp; Text = $_.Text }
     }
+}
+
+function ConvertTo-SqliteReadOnlyUri {
+    # Builds a read-only sqlite3 "file:" URI from a filesystem path. Percent-encodes
+    # the characters that are significant in a URI and realistically show up in a
+    # real Windows path (Wispr's default DB lives under "...\Wispr Flow\flow.sqlite",
+    # which contains a space) -- '%' is encoded first so an already-escaped path isn't
+    # double-escaped, then space, '#', and '?'.
+    param([string]$DbPath)
+    $path = ($DbPath -replace '\\', '/')
+    $path = $path.Replace('%', '%25').Replace('#', '%23').Replace('?', '%3F').Replace(' ', '%20')
+    'file:' + $path + '?mode=ro'
 }
 
 function Invoke-Sqlite {
@@ -82,10 +90,41 @@ function Invoke-Sqlite {
         [Parameter(Mandatory)][string]$DbPath,
         [Parameter(Mandatory)][string]$Sql
     )
-    $uri = 'file:' + ($DbPath -replace '\\','/') + '?mode=ro'
-    $json = $Sql | & $Sqlite3Path -json -readonly $uri 2>$null
-    if (-not $json) { return @() }
-    @($json | ConvertFrom-Json)   # ConvertFrom-Json yields a single object for one row; normalize to array
+    $uri = ConvertTo-SqliteReadOnlyUri $DbPath
+
+    # Merge stderr into the output (2>&1) instead of discarding it with 2>$null:
+    # native stderr lines arrive as ErrorRecord objects mixed in with the plain-string
+    # stdout lines, so they can be separated below. This lets a genuine sqlite3 failure
+    # (missing table, malformed SQL, a corrupt/missing DB file) be told apart from a
+    # legitimately empty result set and surfaced with the real error text instead of
+    # being silently masked as "no rows".
+    $raw = $Sql | & $Sqlite3Path -json -readonly $uri 2>&1
+    $exitCode = $LASTEXITCODE
+    $stdoutLines = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    $stderrText  = (@($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                        ForEach-Object { $_.ToString() })) -join "`n"
+
+    if ($exitCode -ne 0) {
+        throw "sqlite3 failed (exit code ${exitCode}) against '$DbPath': $stderrText"
+    }
+
+    # sqlite3 -json can split its JSON result array across multiple output lines (one
+    # row fragment per line); join them back into a single string before parsing so
+    # ConvertFrom-Json sees one complete document instead of per-line fragments that
+    # don't individually parse.
+    $joined = ($stdoutLines -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($joined)) { return @() }
+
+    # Parse, then wrap the result in @() as a *separate* statement. Wrapping @()
+    # directly around an expression that itself invokes ConvertFrom-Json (e.g.
+    # `@($x | ConvertFrom-Json)` or `@(ConvertFrom-Json $x)`) was empirically observed,
+    # on this PowerShell 5.1 / sqlite3 3.53.4 combination, to silently truncate a
+    # multi-row JSON array down to just its first element. Splitting the parse and the
+    # array-normalization into two statements avoids that.
+    $parsed = ConvertFrom-Json $joined
+    $rows = @($parsed)   # normalizes a single-row result (which ConvertFrom-Json
+                          # yields as a lone object, not a 1-element array) to an array
+    $rows
 }
 
 function Get-DbMaxTimestamp {

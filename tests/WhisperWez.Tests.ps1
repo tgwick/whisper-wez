@@ -106,3 +106,55 @@ INSERT INTO History VALUES ('b','2026-09-02 10:00:06.100 +00:00','wezterm-gui','
         Remove-Item $empty -Force
     }
 }
+
+Describe 'Invoke-Sqlite' {
+    BeforeAll {
+        $script:sqlite3v = Resolve-Sqlite3Path -RepoRoot (Join-Path $PSScriptRoot '..')
+        $script:db3 = Join-Path ([IO.Path]::GetTempPath()) ("ww_multi_" + [guid]::NewGuid() + ".sqlite")
+        $rowInserts = 1..15 | ForEach-Object { "INSERT INTO t VALUES ($_, 'row$_');" }
+        $ddl3 = "CREATE TABLE t (n INTEGER, label TEXT);`n" + ($rowInserts -join "`n")
+        $ddl3 | & $script:sqlite3v $script:db3
+    }
+    AfterAll { Remove-Item $script:db3 -Force -ErrorAction SilentlyContinue }
+
+    It 'round-trips every row when sqlite3 -json output spans multiple lines' {
+        $result = Invoke-Sqlite -Sqlite3Path $script:sqlite3v -DbPath $script:db3 -Sql 'SELECT n, label FROM t ORDER BY n;'
+        @($result).Count | Should -Be 15
+        ($result | ForEach-Object label) | Should -Be (1..15 | ForEach-Object { "row$_" })
+    }
+
+    It 'throws with the sqlite3 error text when the query references a table that does not exist' {
+        { Invoke-Sqlite -Sqlite3Path $script:sqlite3v -DbPath $script:db3 -Sql 'SELECT * FROM NoSuchTable;' } |
+            Should -Throw '*no such table*'
+    }
+
+    It 'throws when the SQL is malformed' {
+        { Invoke-Sqlite -Sqlite3Path $script:sqlite3v -DbPath $script:db3 -Sql 'SELECT FROM FROM;;;' } | Should -Throw
+    }
+
+    It 'returns an empty array (not an error) for a query that legitimately matches no rows' {
+        $result = Invoke-Sqlite -Sqlite3Path $script:sqlite3v -DbPath $script:db3 -Sql 'SELECT n, label FROM t WHERE n > 999;'
+        @($result).Count | Should -Be 0
+    }
+}
+
+Describe 'Read-NewTranscripts with a space in the DB path' {
+    BeforeAll {
+        $script:sqliteSp = Resolve-Sqlite3Path -RepoRoot (Join-Path $PSScriptRoot '..')
+        $script:dirSp = Join-Path ([IO.Path]::GetTempPath()) ("ww space " + [guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:dirSp | Out-Null
+        $script:dbSp = Join-Path $script:dirSp 'flow.sqlite'
+        $ddlSp = @'
+CREATE TABLE History (transcriptEntityId TEXT PRIMARY KEY, timestamp TEXT, app TEXT, formattedText TEXT, asrText TEXT, status TEXT);
+INSERT INTO History VALUES ('sp1','2026-09-02 10:00:00.100 +00:00','wezterm-gui','space path works','raw','formatted');
+'@
+        $ddlSp | & $script:sqliteSp $script:dbSp
+    }
+    AfterAll { Remove-Item $script:dirSp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'reads rows correctly when the DB directory name contains a space' {
+        $rows = Read-NewTranscripts -DbPath $script:dbSp -Sqlite3Path $script:sqliteSp -TargetApp 'wezterm-gui' -SinceTimestamp '2026-09-02 00:00:00.000 +00:00'
+        ($rows | ForEach-Object Id) | Should -Be @('sp1')
+        ($rows | Where-Object Id -eq 'sp1').Text | Should -Be 'space path works'
+    }
+}
