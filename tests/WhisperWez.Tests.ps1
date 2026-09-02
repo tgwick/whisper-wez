@@ -269,3 +269,35 @@ Describe 'SendInput INPUT struct ABI size' {
         [WWInput]::InputStructSize() | Should -Be $expected
     }
 }
+
+Describe 'Invoke-Injection' {
+    BeforeEach {
+        $script:cfg = Get-WhisperWezConfig -Overrides @{ RestoreClipboard = $true; ClipboardRestoreDelayMs = 0 }
+        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'PREV' }
+        Mock -ModuleName WhisperWez Set-ClipboardTextSafe { $true }
+        Mock -ModuleName WhisperWez Send-CtrlV {}
+        Mock -ModuleName WhisperWez Start-Sleep {}
+    }
+    It 'pastes and restores when WezTerm is focused' {
+        Mock -ModuleName WhisperWez Test-TargetFocused { $true }
+        $r = Invoke-Injection -Text 'hello' -Config $script:cfg
+        $r.Action  | Should -Be 'pasted'
+        $r.Focused | Should -BeTrue
+        Should -Invoke -ModuleName WhisperWez Send-CtrlV -Times 1 -Exactly
+        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 2 -Exactly  # set text, then restore
+    }
+    It 'sets clipboard only when not focused' {
+        Mock -ModuleName WhisperWez Test-TargetFocused { $false }
+        $r = Invoke-Injection -Text 'hello' -Config $script:cfg
+        $r.Action | Should -Be 'clipboard-only'
+        Should -Invoke -ModuleName WhisperWez Send-CtrlV -Times 0 -Exactly
+        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 1 -Exactly
+    }
+    It 'does nothing to the OS in DryRun' {
+        Mock -ModuleName WhisperWez Test-TargetFocused { $true }
+        $r = Invoke-Injection -Text 'hello' -Config $script:cfg -DryRun
+        $r.Action | Should -Be 'dryrun'
+        Should -Invoke -ModuleName WhisperWez Send-CtrlV -Times 0 -Exactly
+        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 0 -Exactly
+    }
+}

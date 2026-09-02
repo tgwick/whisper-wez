@@ -261,4 +261,32 @@ function Send-CtrlV {
     if ($sent -ne 4) { throw "SendInput injected $sent of 4 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
 }
 
+function Invoke-Injection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][hashtable]$Config,
+        [switch]$DryRun
+    )
+    $focused = Test-TargetFocused -TargetApp $Config.TargetApp
+
+    if ($DryRun) {
+        return [pscustomobject]@{ Action = 'dryrun'; Focused = $focused }
+    }
+
+    if (-not $focused) {
+        [void](Set-ClipboardTextSafe -Text $Text)
+        return [pscustomobject]@{ Action = 'clipboard-only'; Focused = $false }
+    }
+
+    $prev = if ($Config.RestoreClipboard) { Get-ClipboardTextSafe } else { $null }
+    [void](Set-ClipboardTextSafe -Text $Text)
+    Send-CtrlV
+    if ($Config.RestoreClipboard) {
+        Start-Sleep -Milliseconds $Config.ClipboardRestoreDelayMs
+        [void](Set-ClipboardTextSafe -Text $prev)
+    }
+    [pscustomobject]@{ Action = 'pasted'; Focused = $true }
+}
+
 Export-ModuleMember -Function *
