@@ -176,4 +176,33 @@ function Update-WhisperWezState {
     [pscustomobject]@{ LastTimestamp = $last; RecentIds = $ids }
 }
 
+$script:User32 = @'
+using System;
+using System.Runtime.InteropServices;
+public static class WWUser32 {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+}
+'@
+if (-not ('WWUser32' -as [type])) { Add-Type -TypeDefinition $script:User32 }
+
+function Get-ForegroundProcessName {
+    [CmdletBinding()]
+    param()
+    try {
+        $h = [WWUser32]::GetForegroundWindow()
+        if ($h -eq [IntPtr]::Zero) { return $null }
+        [uint32]$procId = 0   # NOTE: do not name this $pid (read-only automatic var); type must match the out uint param
+        [void][WWUser32]::GetWindowThreadProcessId($h, [ref]$procId)
+        if ($procId -eq 0) { return $null }
+        (Get-Process -Id $procId -ErrorAction Stop).ProcessName
+    } catch { $null }
+}
+
+function Test-TargetFocused {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$TargetApp)
+    (Get-ForegroundProcessName) -eq $TargetApp
+}
+
 Export-ModuleMember -Function *

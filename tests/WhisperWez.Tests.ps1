@@ -230,3 +230,24 @@ Describe 'WhisperWez state' {
         Remove-Item $f -Force
     }
 }
+
+Describe 'Test-TargetFocused' {
+    It 'is true when foreground matches target' {
+        Mock -ModuleName WhisperWez Get-ForegroundProcessName { 'wezterm-gui' }
+        Test-TargetFocused -TargetApp 'wezterm-gui' | Should -BeTrue
+    }
+    It 'is false when foreground differs' {
+        Mock -ModuleName WhisperWez Get-ForegroundProcessName { 'chrome' }
+        Test-TargetFocused -TargetApp 'wezterm-gui' | Should -BeFalse
+    }
+    It 'is false when foreground is unknown' {
+        Mock -ModuleName WhisperWez Get-ForegroundProcessName { $null }
+        Test-TargetFocused -TargetApp 'wezterm-gui' | Should -BeFalse
+    }
+}
+
+Describe 'Get-ForegroundProcessName (smoke)' {
+    It 'returns a string or null without throwing' {
+        { Get-ForegroundProcessName } | Should -Not -Throw
+    }
+}
