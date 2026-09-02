@@ -16,7 +16,9 @@
 - **Never auto-execute:** inject only via clipboard + `Ctrl+V` (bracketed paste). Never simulate per-character typing or send Enter.
 - **Target app string:** `wezterm-gui` (exact value Wispr stores in `History.app`).
 - **DB path:** `Join-Path $env:APPDATA 'Wispr Flow\flow.sqlite'`.
-- **No backlog replay:** on first run, initialize the high-water mark to "now".
+- **No backlog replay:** on first run, initialize the high-water mark to the DB's current `MAX(timestamp)` (NOT local `Get-Date`).
+- **Timestamps are DB-native UTC strings** of the form `YYYY-MM-DD HH:MM:SS.fff +00:00` (fixed width → lexicographic string comparison is time-monotonic). Both sides of every comparison MUST be DB-native strings; never generate a comparison timestamp from local `Get-Date`.
+- **Finalization status:** inject only rows with `status IN ('formatted','raw_transcript')` (excludes `processing`, `empty`, `no_audio`, `dismissed`).
 - **Test command (run from WSL):** `powershell.exe -NoProfile -Command "Import-Module Pester -MinimumVersion 5.0 -Force; Invoke-Pester -Path 'D:\Git\Personal\WhisperWez\tests\WhisperWez.Tests.ps1' -Output Detailed"`
 - Repo root (Windows): `D:\Git\Personal\WhisperWez`  (WSL: `/mnt/d/Git/Personal/WhisperWez`).
 
@@ -227,7 +229,8 @@ Reads finalized, WezTerm-targeted rows newer-or-equal to a cutoff, using `sqlite
 
 **Interfaces:**
 - Consumes: `Resolve-Sqlite3Path`.
-- Produces: `Read-NewTranscripts -DbPath <string> -Sqlite3Path <string> -TargetApp <string> -SinceTimestamp <string>` → array of `[pscustomobject]@{ Id; Timestamp; Text }`, ordered by `Timestamp` ascending. Rows with empty `formattedText` fall back to `asrText`; rows with neither are excluded.
+- Produces: `Read-NewTranscripts -DbPath <string> -Sqlite3Path <string> -TargetApp <string> -SinceTimestamp <string>` → array of `[pscustomobject]@{ Id; Timestamp; Text }`, ordered by `Timestamp` ascending. Rows with empty `formattedText` fall back to `asrText`; rows with neither, or with a non-final `status`, are excluded.
+- Produces: `Get-DbMaxTimestamp -DbPath <string> -Sqlite3Path <string>` → `[string]` the current `MAX(timestamp)` across all rows (DB-native UTC string), or `''` if the table is empty. Used to seed the high-water mark on first run.
 
 - [ ] **Step 1: Write the failing integration test**
 
@@ -237,35 +240,70 @@ Describe 'Read-NewTranscripts' {
     BeforeAll {
         $script:sqlite = Resolve-Sqlite3Path -RepoRoot (Join-Path $PSScriptRoot '..')
         $script:db = Join-Path ([IO.Path]::GetTempPath()) ("ww_" + [guid]::NewGuid() + ".sqlite")
+        # Timestamps mirror the real DB shape: UTC, milliseconds, "+00:00" suffix.
         $ddl = @'
-CREATE TABLE History (transcriptEntityId TEXT PRIMARY KEY, timestamp TEXT, app TEXT, formattedText TEXT, asrText TEXT);
-INSERT INTO History VALUES ('id1','2026-09-02 10:00:00','wezterm-gui','hello world','hello raw');
-INSERT INTO History VALUES ('id2','2026-09-02 10:00:01','wezterm-gui','','fallback text');
-INSERT INTO History VALUES ('id3','2026-09-02 10:00:02','wezterm-gui','','');
-INSERT INTO History VALUES ('id4','2026-09-02 10:00:03','chrome','other app','other');
-INSERT INTO History VALUES ('id5','2026-09-02 09:00:00','wezterm-gui','too old','old');
-INSERT INTO History VALUES ('id6','2026-09-02 10:00:04','wezterm-gui','line1
-line2','multi');
+CREATE TABLE History (transcriptEntityId TEXT PRIMARY KEY, timestamp TEXT, app TEXT, formattedText TEXT, asrText TEXT, status TEXT);
+INSERT INTO History VALUES ('id1','2026-09-02 10:00:00.100 +00:00','wezterm-gui','hello world','hello raw','formatted');
+INSERT INTO History VALUES ('id2','2026-09-02 10:00:01.100 +00:00','wezterm-gui','','fallback text','formatted');
+INSERT INTO History VALUES ('id3','2026-09-02 10:00:02.100 +00:00','wezterm-gui','','','formatted');
+INSERT INTO History VALUES ('id4','2026-09-02 10:00:03.100 +00:00','chrome','other app','other','formatted');
+INSERT INTO History VALUES ('id5','2026-09-02 09:00:00.100 +00:00','wezterm-gui','too old','old','formatted');
+INSERT INTO History VALUES ('id6','2026-09-02 10:00:04.100 +00:00','wezterm-gui','line1
+line2','multi','formatted');
+INSERT INTO History VALUES ('id7','2026-09-02 10:00:05.100 +00:00','wezterm-gui','half baked','partial','processing');
+INSERT INTO History VALUES ('id8','2026-09-02 10:00:06.100 +00:00','wezterm-gui','raw only','raw asr','raw_transcript');
 '@
         $ddl | & $script:sqlite $script:db
+        $script:since = '2026-09-02 10:00:00.100 +00:00'
     }
     AfterAll { Remove-Item $script:db -Force -ErrorAction SilentlyContinue }
 
     It 'returns only new, finalized, wezterm rows in ascending order' {
-        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp '2026-09-02 10:00:00'
-        ($rows | ForEach-Object Id) | Should -Be @('id1','id2','id6')
+        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp $script:since
+        ($rows | ForEach-Object Id) | Should -Be @('id1','id2','id6','id8')
     }
     It 'applies asrText fallback when formattedText is empty' {
-        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp '2026-09-02 10:00:00'
+        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp $script:since
         ($rows | Where-Object Id -eq 'id2').Text | Should -Be 'fallback text'
     }
     It 'excludes rows where both text columns are empty' {
-        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp '2026-09-02 10:00:00'
+        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp $script:since
         ($rows | Where-Object Id -eq 'id3') | Should -BeNullOrEmpty
     }
+    It 'excludes non-final (processing) rows' {
+        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp $script:since
+        ($rows | Where-Object Id -eq 'id7') | Should -BeNullOrEmpty
+    }
+    It 'includes raw_transcript rows' {
+        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp $script:since
+        ($rows | Where-Object Id -eq 'id8').Text | Should -Be 'raw only'
+    }
     It 'preserves multi-line text' {
-        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp '2026-09-02 10:00:00'
+        $rows = Read-NewTranscripts -DbPath $script:db -Sqlite3Path $script:sqlite -TargetApp 'wezterm-gui' -SinceTimestamp $script:since
         ($rows | Where-Object Id -eq 'id6').Text | Should -Be "line1`nline2"
+    }
+}
+
+Describe 'Get-DbMaxTimestamp' {
+    BeforeAll {
+        $script:sqlite2 = Resolve-Sqlite3Path -RepoRoot (Join-Path $PSScriptRoot '..')
+        $script:db2 = Join-Path ([IO.Path]::GetTempPath()) ("ww_max_" + [guid]::NewGuid() + ".sqlite")
+        @'
+CREATE TABLE History (transcriptEntityId TEXT PRIMARY KEY, timestamp TEXT, app TEXT, formattedText TEXT, asrText TEXT, status TEXT);
+INSERT INTO History VALUES ('a','2026-09-02 10:00:00.100 +00:00','chrome','x','x','formatted');
+INSERT INTO History VALUES ('b','2026-09-02 10:00:06.100 +00:00','wezterm-gui','y','y','formatted');
+'@ | & $script:sqlite2 $script:db2
+    }
+    AfterAll { Remove-Item $script:db2 -Force -ErrorAction SilentlyContinue }
+
+    It 'returns the maximum timestamp across all rows' {
+        Get-DbMaxTimestamp -DbPath $script:db2 -Sqlite3Path $script:sqlite2 | Should -Be '2026-09-02 10:00:06.100 +00:00'
+    }
+    It 'returns empty string for an empty table' {
+        $empty = Join-Path ([IO.Path]::GetTempPath()) ("ww_empty_" + [guid]::NewGuid() + ".sqlite")
+        'CREATE TABLE History (transcriptEntityId TEXT, timestamp TEXT);' | & $script:sqlite2 $empty
+        Get-DbMaxTimestamp -DbPath $empty -Sqlite3Path $script:sqlite2 | Should -Be ''
+        Remove-Item $empty -Force
     }
 }
 ```
@@ -301,20 +339,40 @@ SELECT transcriptEntityId AS Id, timestamp AS Timestamp,
 FROM History
 WHERE app = $app
   AND timestamp >= $since
+  AND status IN ('formatted','raw_transcript')
   AND COALESCE(NULLIF(formattedText,''), NULLIF(asrText,'')) IS NOT NULL
 ORDER BY timestamp ASC;
 "@
-
-    # Read-only connection via a file: URI so Wispr's live DB is never locked/modified.
-    $uri = 'file:' + ($DbPath -replace '\\','/') + '?mode=ro'
-    $json = $sql | & $Sqlite3Path -json -readonly $uri 2>$null
-    if (-not $json) { return @() }
-
-    $parsed = $json | ConvertFrom-Json
-    # ConvertFrom-Json yields a single object (not array) for one row; normalize.
-    @($parsed) | ForEach-Object {
+    Invoke-Sqlite -Sqlite3Path $Sqlite3Path -DbPath $DbPath -Sql $sql | ForEach-Object {
         [pscustomobject]@{ Id = $_.Id; Timestamp = $_.Timestamp; Text = $_.Text }
     }
+}
+
+function Invoke-Sqlite {
+    # Runs a query against a read-only connection so Wispr's live DB is never locked/modified.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Sqlite3Path,
+        [Parameter(Mandatory)][string]$DbPath,
+        [Parameter(Mandatory)][string]$Sql
+    )
+    $uri = 'file:' + ($DbPath -replace '\\','/') + '?mode=ro'
+    $json = $Sql | & $Sqlite3Path -json -readonly $uri 2>$null
+    if (-not $json) { return @() }
+    @($json | ConvertFrom-Json)   # ConvertFrom-Json yields a single object for one row; normalize to array
+}
+
+function Get-DbMaxTimestamp {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DbPath,
+        [Parameter(Mandatory)][string]$Sqlite3Path
+    )
+    if (-not (Test-Path $DbPath)) { throw "DB not found: $DbPath" }
+    $rows = Invoke-Sqlite -Sqlite3Path $Sqlite3Path -DbPath $DbPath `
+                -Sql "SELECT COALESCE(MAX(timestamp),'') AS MaxTs FROM History;"
+    if (-not $rows) { return '' }
+    [string]$rows[0].MaxTs
 }
 ```
 
@@ -513,10 +571,10 @@ function Get-ForegroundProcessName {
     try {
         $h = [WWUser32]::GetForegroundWindow()
         if ($h -eq [IntPtr]::Zero) { return $null }
-        $pid = 0
-        [void][WWUser32]::GetWindowThreadProcessId($h, [ref]$pid)
-        if ($pid -eq 0) { return $null }
-        (Get-Process -Id $pid -ErrorAction Stop).ProcessName
+        [uint32]$procId = 0   # NOTE: do not name this $pid (read-only automatic var); type must match the out uint param
+        [void][WWUser32]::GetWindowThreadProcessId($h, [ref]$procId)
+        if ($procId -eq 0) { return $null }
+        (Get-Process -Id $procId -ErrorAction Stop).ProcessName
     } catch { $null }
 }
 
@@ -812,8 +870,8 @@ cd /mnt/d/Git/Personal/WhisperWez && git add -A && git commit -m "add rolling fi
 - Modify: `tests/WhisperWez.Tests.ps1`
 
 **Interfaces:**
-- Consumes: `Get-WhisperWezConfig`, `Resolve-Sqlite3Path`, state functions, `Read-NewTranscripts`, `Invoke-Injection`, `Write-WhisperWezLog`.
-- Produces: `Start-WhisperWez -Config <hashtable> [-DryRun] [-Once]` → void. Loads-or-initializes state, then each tick reads new transcripts, injects the unprocessed ones, updates+saves state, logs. `-Once` runs exactly one poll (for tests); without it, loops forever sleeping `PollMs` between ticks.
+- Consumes: `Get-WhisperWezConfig`, `Resolve-Sqlite3Path`, `Get-DbMaxTimestamp`, state functions, `Read-NewTranscripts`, `Invoke-Injection`, `Write-WhisperWezLog`.
+- Produces: `Start-WhisperWez -Config <hashtable> [-DryRun] [-Once]` → void. Loads-or-initializes state (seeding the high-water mark from `Get-DbMaxTimestamp` on first run), then each tick reads new transcripts, injects the unprocessed ones, updates+saves state, logs. `-Once` runs exactly one poll (for tests); without it, loops forever sleeping `PollMs` between ticks.
 
 - [ ] **Step 1: Write the failing tests (mock DB + injection)**
 
@@ -830,6 +888,7 @@ Describe 'Start-WhisperWez -Once' {
         }
         Mock -ModuleName WhisperWez Invoke-Injection { [pscustomobject]@{ Action='pasted'; Focused=$true } }
         Mock -ModuleName WhisperWez Write-WhisperWezLog {}
+        Mock -ModuleName WhisperWez Get-DbMaxTimestamp { '2026-09-02 12:00:00.000 +00:00' }
     }
     AfterEach { Remove-Item $script:stateFile -Force -ErrorAction SilentlyContinue }
 
@@ -878,9 +937,11 @@ function Start-WhisperWez {
     )
     $state = Get-WhisperWezState -StateFile $Config.StateFile
     if ($null -eq $state) {
-        $state = New-WhisperWezState
+        # Seed from the DB's own clock/format (UTC) so timestamp comparisons are apples-to-apples.
+        $seed = Get-DbMaxTimestamp -DbPath $Config.DbPath -Sqlite3Path $Config.Sqlite3Path
+        $state = New-WhisperWezState -Now $seed
         Save-WhisperWezState -StateFile $Config.StateFile -State $state
-        Write-WhisperWezLog -LogFile $Config.LogFile -Message "Initialized state at $($state.LastTimestamp)"
+        Write-WhisperWezLog -LogFile $Config.LogFile -Message "Initialized high-water mark at '$seed'"
     }
 
     do {
@@ -974,8 +1035,8 @@ Add to `WhisperWez.psm1`:
 function New-WhisperWezTaskAction {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ScriptPath)
-    $args = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath
-    New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
+    $taskArgs = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath  # avoid $args (automatic var)
+    New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs
 }
 ```
 
