@@ -201,4 +201,32 @@ Describe 'WhisperWez state' {
         Test-TranscriptProcessed -State $s -Row ([pscustomobject]@{ Id='seen' })  | Should -BeTrue
         Test-TranscriptProcessed -State $s -Row ([pscustomobject]@{ Id='new' })   | Should -BeFalse
     }
+    It 'Save/Get round-trips a 1-element RecentIds without collapsing it to a scalar' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.json')
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        $s = Update-WhisperWezState -State $s -Row ([pscustomobject]@{ Id='only1'; Timestamp='2026-09-02 12:00:01'; Text='x' })
+        Save-WhisperWezState -StateFile $f -State $s
+        $reloaded = Get-WhisperWezState -StateFile $f
+        # Assert the raw returned property is actually an array (not a scalar the JSON
+        # round-trip collapsed it to) before any test-side @() re-normalization would mask it.
+        $reloaded.RecentIds -is [array] | Should -BeTrue
+        @($reloaded.RecentIds).Count | Should -Be 1
+        $reloaded.RecentIds | Should -Contain 'only1'
+        Test-TranscriptProcessed -State $reloaded -Row ([pscustomobject]@{ Id='only1' }) | Should -BeTrue
+        Remove-Item $f -Force
+    }
+    It 'Save/Get round-trips a multi-element RecentIds' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.json')
+        $s = New-WhisperWezState -Now '2026-09-02 12:00:00'
+        $s = Update-WhisperWezState -State $s -Row ([pscustomobject]@{ Id='m1'; Timestamp='2026-09-02 12:00:01'; Text='x' })
+        $s = Update-WhisperWezState -State $s -Row ([pscustomobject]@{ Id='m2'; Timestamp='2026-09-02 12:00:02'; Text='x' })
+        Save-WhisperWezState -StateFile $f -State $s
+        $reloaded = Get-WhisperWezState -StateFile $f
+        @($reloaded.RecentIds).Count | Should -Be 2
+        $reloaded.RecentIds | Should -Contain 'm1'
+        $reloaded.RecentIds | Should -Contain 'm2'
+        Test-TranscriptProcessed -State $reloaded -Row ([pscustomobject]@{ Id='m1' }) | Should -BeTrue
+        Test-TranscriptProcessed -State $reloaded -Row ([pscustomobject]@{ Id='m2' }) | Should -BeTrue
+        Remove-Item $f -Force
+    }
 }
