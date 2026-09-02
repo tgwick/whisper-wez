@@ -6,3 +6,6 @@ whisperwez.log
 # Bundled binary is large; document how to fetch it in README instead of committing
 # (remove this line if you prefer to vendor sqlite3.exe directly)
 sqlite3.exe
+
+# SDD scratch (ledger, briefs, review packages)
+.superpowers/
