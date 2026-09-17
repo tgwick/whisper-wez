@@ -26,6 +26,8 @@ function Get-WhisperWezConfig {
         PollMs                  = 400
         RestoreClipboard        = $false
         ClipboardRestoreDelayMs = 300
+        ClipboardSettleMs       = 1500  # max time to wait for Wispr to release the clipboard before pasting
+        ClipboardStableMs       = 200   # our text must hold unchanged this long (Wispr done) before we paste
         MaxRecentIds            = 50
         StateFile               = Join-Path $root 'state.json'
         LogFile                 = Join-Path $root 'whisperwez.log'
@@ -227,7 +229,7 @@ function Set-ClipboardTextSafe {
 $script:SendInput = @'
 using System;
 using System.Runtime.InteropServices;
-public static class WWInput {
+public static class WWPaste {
     [StructLayout(LayoutKind.Sequential)]
     struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [StructLayout(LayoutKind.Sequential)]
@@ -241,24 +243,29 @@ public static class WWInput {
     [DllImport("user32.dll", SetLastError=true)]
     static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     const uint INPUT_KEYBOARD = 1; const uint KEYEVENTF_KEYUP = 2;
-    const ushort VK_CONTROL = 0x11; const ushort VK_V = 0x56;
+    const ushort VK_CONTROL = 0x11; const ushort VK_SHIFT = 0x10; const ushort VK_V = 0x56;
     static INPUT Key(ushort vk, bool up) {
         return new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0 } } };
     }
     public static int InputStructSize() { return Marshal.SizeOf(typeof(INPUT)); }
-    public static uint CtrlV() {
-        INPUT[] seq = new INPUT[] { Key(VK_CONTROL,false), Key(VK_V,false), Key(VK_V,true), Key(VK_CONTROL,true) };
+    // WezTerm's default paste binding is Ctrl+Shift+V. Plain Ctrl+V is NOT paste in WezTerm --
+    // it passes through to the WSL shell where readline treats it as quoted-insert -- so the
+    // Shift is required for the transcript to actually paste.
+    public static uint CtrlShiftV() {
+        INPUT[] seq = new INPUT[] {
+            Key(VK_CONTROL,false), Key(VK_SHIFT,false), Key(VK_V,false),
+            Key(VK_V,true), Key(VK_SHIFT,true), Key(VK_CONTROL,true) };
         return SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT)));
     }
 }
 '@
-if (-not ('WWInput' -as [type])) { Add-Type -TypeDefinition $script:SendInput }
+if (-not ('WWPaste' -as [type])) { Add-Type -TypeDefinition $script:SendInput }
 
-function Send-CtrlV {
+function Send-PasteChord {
     [CmdletBinding()]
     param()
-    $sent = [WWInput]::CtrlV()
-    if ($sent -ne 4) { throw "SendInput injected $sent of 4 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
+    $sent = [WWPaste]::CtrlShiftV()
+    if ($sent -ne 6) { throw "SendInput injected $sent of 6 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
 }
 
 function Invoke-Injection {
@@ -280,8 +287,39 @@ function Invoke-Injection {
     }
 
     $prev = if ($Config.RestoreClipboard) { Get-ClipboardTextSafe } else { $null }
+
+    # Wispr Flow manipulates the clipboard around each dictation (copies the transcript,
+    # attempts its own insert, then clears/restores) and can keep it locked or empty for a
+    # few hundred ms AFTER the DB row is finalized -- during that window our own Set/Get come
+    # back empty (observed: three reads at len=0), and pasting into it yields empty or stale
+    # text. So don't race: assert our text, then wait until it has HELD unchanged for a short
+    # stability window (proof Wispr has finished touching the clipboard), re-asserting on any
+    # drift, and only then paste. Bounded by ClipboardSettleMs so a stuck clipboard can't hang
+    # the loop.
     [void](Set-ClipboardTextSafe -Text $Text)
-    Send-CtrlV
+    $deadline    = [DateTime]::UtcNow.AddMilliseconds([int]$Config.ClipboardSettleMs)
+    $stableSince = $null
+    $reasserts   = 0
+    $stable      = $false
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ((Get-ClipboardTextSafe) -eq $Text) {
+            if ($null -eq $stableSince) { $stableSince = [DateTime]::UtcNow }
+            elseif (([DateTime]::UtcNow - $stableSince).TotalMilliseconds -ge [int]$Config.ClipboardStableMs) {
+                $stable = $true; break
+            }
+        } else {
+            [void](Set-ClipboardTextSafe -Text $Text)   # Wispr clobbered it -- put our text back
+            $stableSince = $null
+            $reasserts++
+        }
+        Start-Sleep -Milliseconds 30
+    }
+    if ($reasserts -gt 0 -or -not $stable) {
+        Write-WhisperWezLog -LogFile $Config.LogFile -Level ($(if ($stable) { 'INFO' } else { 'WARN' })) `
+            -Message ("clipboard settle: stable={0} reasserts={1} (Wispr clipboard contention)" -f $stable, $reasserts)
+    }
+
+    Send-PasteChord
     if ($Config.RestoreClipboard) {
         Start-Sleep -Milliseconds $Config.ClipboardRestoreDelayMs
         [void](Set-ClipboardTextSafe -Text $prev)

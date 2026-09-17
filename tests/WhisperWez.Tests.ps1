@@ -17,6 +17,8 @@ Describe 'Get-WhisperWezConfig' {
         $c.RestoreClipboard       | Should -BeFalse
         $c.MaxRecentIds           | Should -Be 50
         $c.ClipboardRestoreDelayMs| Should -Be 300
+        $c.ClipboardSettleMs      | Should -Be 1500
+        $c.ClipboardStableMs      | Should -Be 200
         $c.DbPath                 | Should -Match 'flow\.sqlite$'
     }
     It 'applies overrides' {
@@ -266,38 +268,59 @@ Describe 'Clipboard primitives' {
 Describe 'SendInput INPUT struct ABI size' {
     It 'INPUT marshals to the native size for this architecture' {
         $expected = if ([Environment]::Is64BitProcess) { 40 } else { 28 }
-        [WWInput]::InputStructSize() | Should -Be $expected
+        [WWPaste]::InputStructSize() | Should -Be $expected
     }
 }
 
 Describe 'Invoke-Injection' {
     BeforeEach {
-        $script:cfg = Get-WhisperWezConfig -Overrides @{ RestoreClipboard = $true; ClipboardRestoreDelayMs = 0 }
-        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'PREV' }
+        $script:cfg = Get-WhisperWezConfig -Overrides @{ RestoreClipboard = $true; ClipboardRestoreDelayMs = 0; ClipboardStableMs = 0 }
         Mock -ModuleName WhisperWez Set-ClipboardTextSafe { $true }
-        Mock -ModuleName WhisperWez Send-CtrlV {}
+        Mock -ModuleName WhisperWez Send-PasteChord {}
         Mock -ModuleName WhisperWez Start-Sleep {}
+        Mock -ModuleName WhisperWez Write-WhisperWezLog {}
     }
     It 'pastes and restores when WezTerm is focused' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $true }
+        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'hello' }  # clipboard holds our text from the first read
         $r = Invoke-Injection -Text 'hello' -Config $script:cfg
         $r.Action  | Should -Be 'pasted'
         $r.Focused | Should -BeTrue
-        Should -Invoke -ModuleName WhisperWez Send-CtrlV -Times 1 -Exactly
-        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 2 -Exactly  # set text, then restore
+        Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 1 -Exactly
+        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 2 -Exactly  # initial set, then restore (no drift)
+    }
+    It 'waits out contention and re-asserts when Wispr clobbers the clipboard before paste' {
+        Mock -ModuleName WhisperWez Test-TargetFocused { $true }
+        # First read comes back empty (Wispr still holds it); after our re-assert it holds our text.
+        $global:wwReads = 0
+        Mock -ModuleName WhisperWez Get-ClipboardTextSafe {
+            $global:wwReads++
+            if ($global:wwReads -eq 1) { '' } else { 'hello' }
+        }
+        try {
+            $r = Invoke-Injection -Text 'hello' -Config (Get-WhisperWezConfig -Overrides @{ RestoreClipboard = $false; ClipboardStableMs = 0 })
+            $r.Action | Should -Be 'pasted'
+            Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 2 -Exactly  # initial set + one re-assert
+            Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 1 -Exactly
+            Should -Invoke -ModuleName WhisperWez Write-WhisperWezLog -Times 1 -Exactly    # settle summary logged
+        } finally {
+            Remove-Variable -Name wwReads -Scope Global -ErrorAction SilentlyContinue
+        }
     }
     It 'sets clipboard only when not focused' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $false }
+        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'PREV' }
         $r = Invoke-Injection -Text 'hello' -Config $script:cfg
         $r.Action | Should -Be 'clipboard-only'
-        Should -Invoke -ModuleName WhisperWez Send-CtrlV -Times 0 -Exactly
+        Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 0 -Exactly
         Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 1 -Exactly
     }
     It 'does nothing to the OS in DryRun' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $true }
+        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'PREV' }
         $r = Invoke-Injection -Text 'hello' -Config $script:cfg -DryRun
         $r.Action | Should -Be 'dryrun'
-        Should -Invoke -ModuleName WhisperWez Send-CtrlV -Times 0 -Exactly
+        Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 0 -Exactly
         Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 0 -Exactly
     }
 }

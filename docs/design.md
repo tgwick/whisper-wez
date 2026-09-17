@@ -15,7 +15,10 @@ nothing lands in WezTerm and the clipboard is untouched (stale).
 This was confirmed empirically:
 
 - WezTerm launches into `WSL:Ubuntu` (`config.default_domain = 'WSL:Ubuntu'`).
-- Manual `Ctrl+V` pastes correctly in WezTerm (bracketed paste works).
+- Manual paste works in WezTerm via its default binding **`Ctrl+Shift+V`** (bracketed
+  paste). Note: plain `Ctrl+V` is *not* paste in WezTerm — it passes through to the WSL
+  shell (readline quoted-insert), which is why an early `Ctrl+V`-based injector produced
+  empty/garbage output.
 - After dictating into WezTerm, the clipboard still holds prior content — Wispr
   never copied the transcript.
 - Neither WezTerm, Wispr Flow, nor Wispr Flow Helper runs elevated (verified via
@@ -75,12 +78,13 @@ and never writes to it.
    WSL⇄Windows process boundary.
 2. **Language:** PowerShell — ships with Windows, zero install. Bundles the
    official `sqlite3.exe` for DB reads.
-3. **Injection:** clipboard + `Ctrl+V`, which triggers WezTerm's **bracketed
-   paste**. Dictated text lands on the prompt as literal input and does **not**
-   auto-run (user presses Enter). Simulated per-character typing is rejected
-   because a newline in the text could execute a command.
+3. **Injection:** clipboard + `Ctrl+Shift+V` (WezTerm's default paste binding),
+   which triggers WezTerm's **bracketed paste**. Dictated text lands on the prompt
+   as literal input and does **not** auto-run (user presses Enter). Simulated
+   per-character typing is rejected because a newline in the text could execute a
+   command.
 4. **Focus guard:** paste only if WezTerm is the foreground window at inject
-   time. Otherwise leave the transcript on the clipboard for a manual `Ctrl+V`
+   time. Otherwise leave the transcript on the clipboard for a manual `Ctrl+Shift+V`
    and skip the paste. This makes wrong-target insertion impossible.
 5. **Elevation:** run **non-elevated**, matching WezTerm's integrity level, or
    `SendInput` will not reach it.
@@ -101,7 +105,7 @@ Wispr dictation
   → poll finds a NEW, FINALIZED, wezterm-targeted row (timestamp > high-water mark,
     id not already processed)
   → is WezTerm the foreground window?
-       yes → save current clipboard → set clipboard = transcript → SendInput Ctrl+V
+       yes → save current clipboard → set clipboard = transcript → SendInput Ctrl+Shift+V
              → (after short delay) restore previous clipboard
        no  → leave transcript on clipboard, skip paste
   → advance high-water mark, record processed id
@@ -127,8 +131,8 @@ Wispr dictation
   ambiguous.
 - **Injector** — foreground-window check (`GetForegroundWindow` +
   `GetWindowThreadProcessId` → process name compared to `TargetApp`),
-  `Set-Clipboard`, `Ctrl+V` via `SendInput` (P/Invoke: Ctrl down, V down, V up,
-  Ctrl up), then optional clipboard restore.
+  `Set-Clipboard`, `Ctrl+Shift+V` via `SendInput` (P/Invoke: Ctrl down, Shift down,
+  V down, V up, Shift up, Ctrl up), then optional clipboard restore.
 - **Logger** — appends timestamped lines to a rolling log file.
 
 ## Error handling
