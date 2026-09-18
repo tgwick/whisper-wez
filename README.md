@@ -41,16 +41,44 @@ cd D:\Git\Personal\WhisperWez
 .\whisperwez.ps1
 ```
 
-Or install it to start automatically at logon (hidden, one instance):
-
-```powershell
-.\install.ps1                  # register the logon task (may need an elevated prompt to register)
-Start-ScheduledTask -TaskName WhisperWez   # start it now without logging off
-.\uninstall.ps1                # remove it
-```
-
 Then dictate into WezTerm/Claude Code — the transcript is injected when WezTerm is focused.
 If it isn't focused, the text is left on the clipboard for a manual `Ctrl+Shift+V`.
+
+### 3. Start automatically at logon (optional)
+
+Register a hidden, non-elevated Scheduled Task that starts one instance at every logon:
+
+```powershell
+.\install.ps1                                # register the logon task
+Start-ScheduledTask -TaskName WhisperWez     # start it now, without logging off
+```
+
+> If registration fails with "Access is denied", run `.\install.ps1` once from an **elevated**
+> PowerShell. The task still *runs* non-elevated (required to reach WezTerm) — only creating it
+> needs the rights.
+
+**Turning it off** — three levels, depending on what you want:
+
+```powershell
+# a) Stop the currently running instance (leaves auto-start enabled):
+Stop-ScheduledTask -TaskName WhisperWez
+
+# b) Keep the task but stop it launching at logon (easy to re-enable later):
+Disable-ScheduledTask -TaskName WhisperWez
+Enable-ScheduledTask  -TaskName WhisperWez   # turn it back on
+
+# c) Remove it entirely:
+.\uninstall.ps1
+```
+
+Check whether it's installed / its state:
+
+```powershell
+Get-ScheduledTask -TaskName WhisperWez
+```
+
+Note: stopping or removing the task does **not** stop a WhisperWez you launched *by hand* —
+close that PowerShell window (or `Stop-Process` it) separately.
 
 ## Options
 
