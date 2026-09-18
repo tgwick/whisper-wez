@@ -178,6 +178,41 @@ Wispr dictation
   non-elevated) that launches `whisperwez.ps1`; prints the log location.
 - `uninstall.ps1` — unregisters the task.
 
+## Host requirement: suppress Wispr's `Ctrl+V` auto-paste (WezTerm config)
+
+**This is a required manual step for a clean result in TUIs like Claude Code — not
+optional.** WhisperWez alone is not enough because Wispr *also* tries to insert.
+
+Wispr Flow's "auto-paste" (`polishAutoPaste`, on by default and with no per-app off
+switch we could find in its UI) inserts the transcript by putting it on the clipboard
+and sending **`Ctrl+V`**. That behaves differently depending on what is focused inside
+WezTerm:
+
+- **bash / a plain shell:** `Ctrl+V` is readline *quoted-insert* → Wispr's paste is a
+  harmless no-op (this is why WhisperWez originally "just worked" at a shell prompt).
+- **Claude Code (an Ink TUI under WSL):** `Ctrl+V` *is* paste, and pasting from the
+  clipboard in that environment returns a **stale** value (Wispr's own `Alt+Shift+Z`
+  "paste last transcript" shortcut hits the same bug). So Wispr injects a stale clipboard
+  value **and** WhisperWez injects the correct transcript → a doubled, wrong result.
+
+**Mitigation:** make WezTerm swallow `Ctrl+V` so Wispr's paste dies before it reaches the
+app. WhisperWez is unaffected because it injects via a *bracketed paste* (ESC sequences),
+never `Ctrl+V`. Add this to `~/.wezterm.lua` (Windows: `C:\Users\<you>\.wezterm.lua`),
+inside `config.keys`:
+
+```lua
+-- Swallow Ctrl+V so Wispr Flow's Ctrl+V auto-paste can't inject a stale clipboard value
+-- into TUIs (e.g. Claude Code). WhisperWez uses a bracketed paste, not Ctrl+V. Paste with
+-- Ctrl+Shift+V (WezTerm's real paste binding), which is unaffected.
+{ key = 'v', mods = 'CTRL', action = wezterm.action_callback(function() end) },
+```
+
+Reload with `Ctrl+Shift+R` (or restart WezTerm). Verify: copy text, focus Claude Code,
+press `Ctrl+V` — it should do nothing. Trade-off: bare `Ctrl+V` is inert in all WezTerm
+panes; real pasting is `Ctrl+Shift+V` (in a terminal `Ctrl+V` was never paste anyway). We
+cannot block only Wispr's synthetic `Ctrl+V` — WezTerm can't distinguish it from a real
+keypress — so it is all-or-nothing for that key.
+
 ## Files
 
 ```
@@ -196,12 +231,17 @@ WhisperWez/
 
 ## Risks & mitigations
 
-- **Wispr also touches the clipboard** (copies transcript, restores prior
-  contents). WhisperWez reacts *after* the DB row is finalized, i.e. after
-  Wispr's own attempt, so the two do not contend for the same instant; the
-  save/restore is best-effort and logged on failure.
-- **Poll latency** (~400 ms) means a brief delay between finishing dictation and
-  the paste appearing. Tunable via `PollMs`.
+- **Wispr also auto-pastes** (`Ctrl+V`), which in a TUI injects a stale clipboard
+  value alongside WhisperWez's correct transcript. Because WhisperWez no longer uses
+  the clipboard at all (it injects via bracketed paste), this is not a contention we
+  can win in code — it is resolved by the WezTerm `Ctrl+V` swallow documented under
+  *Host requirement* above. Without that config step, expect a doubled/stale result
+  in Claude Code.
+- **Latency** — perceived delay from end-of-speech to text is: Wispr's own
+  formatting time (not ours, usually the largest part) + up to `PollMs` (~400 ms) to
+  detect the row + the paced bracketed-paste duration (`PasteDelayMs` × length). The
+  last two are tunable (`PollMs`, `PasteDelayMs`, or `-PasteDelayMs` on the runner);
+  Wispr's formatting time is the floor.
 - **DB schema changes** in a future Wispr version could break the reader; the
   reader fails safe (logs, no paste) and the query is isolated for easy update.
 - **State/log files** are runtime artifacts and must be git-ignored.
