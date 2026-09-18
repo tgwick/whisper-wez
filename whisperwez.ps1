@@ -1,9 +1,12 @@
 [CmdletBinding()]
-param([switch]$DryRun, [switch]$Once)
+param([switch]$DryRun, [switch]$Once, [int]$PasteDelayMs)
 
 Import-Module (Join-Path $PSScriptRoot 'WhisperWez.psm1') -Force
 $config = Get-WhisperWezConfig
 $config.Sqlite3Path = Resolve-Sqlite3Path -RepoRoot $PSScriptRoot
+# Tune the bracketed-paste per-byte pause from the command line (higher = safer against dropped
+# characters in a TUI, at the cost of a slower paste).
+if ($PSBoundParameters.ContainsKey('PasteDelayMs')) { $config.PasteDelayMs = $PasteDelayMs }
 
 # Single-instance guard. Two overlapping watchers each poll flow.sqlite and each paste the
 # same transcript, so the text lands twice. A named mutex lets only the first instance run;

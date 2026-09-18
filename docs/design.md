@@ -78,14 +78,28 @@ and never writes to it.
    WSL⇄Windows process boundary.
 2. **Language:** PowerShell — ships with Windows, zero install. Bundles the
    official `sqlite3.exe` for DB reads.
-3. **Injection:** clipboard + `Ctrl+Shift+V` (WezTerm's default paste binding),
-   which triggers WezTerm's **bracketed paste**. Dictated text lands on the prompt
-   as literal input and does **not** auto-run (user presses Enter). Simulated
-   per-character typing is rejected because a newline in the text could execute a
-   command.
-4. **Focus guard:** paste only if WezTerm is the foreground window at inject
-   time. Otherwise leave the transcript on the clipboard for a manual `Ctrl+Shift+V`
-   and skip the paste. This makes wrong-target insertion impossible.
+3. **Injection:** deliver the transcript as a synthetic **terminal bracketed paste** —
+   `ESC[200~ <text> ESC[201~` via `SendInput`, one key event at a time with a short
+   per-byte pause. The `ESC[200~` marker puts the terminal app (bash readline, Claude
+   Code) into paste-buffer mode, so it accumulates the bytes as pasted content instead
+   of processing them as keystrokes; the pacing stops character drops. The text is inline
+   in the byte stream, so **no clipboard is used** — which matters because Wispr saves/
+   restores the clipboard around every dictation *and* pasting from the clipboard into
+   Claude Code (under WSL) returns a stale value (Wispr's own paste shortcut hits the same
+   bug). Newlines/tabs/other control chars are **stripped** before injection so a dictated
+   newline can't act as Enter and run a command. ESC is sent as a real `VK_ESCAPE` key;
+   the rest as `KEYEVENTF_UNICODE` characters (layout-independent, handles accents/emoji).
+
+   *Rejected alternatives, in order tried:* clipboard + `Ctrl+V` (plain `Ctrl+V` isn't
+   paste in WezTerm — readline quoted-insert); clipboard + `Ctrl+Shift+V` (WezTerm's real
+   paste, but lost the clipboard race with Wispr → empty/stale); one instantaneous
+   `SendInput` batch of Unicode chars (Claude Code treated it as a paste and read the
+   stale clipboard, or dropped characters); throttled per-character Unicode typing (clean
+   in a shell, but in Claude Code stray characters leaked in from its render/escape-sequence
+   traffic). The paced bracketed paste is what finally works in both a shell and the TUI.
+4. **Focus guard:** inject only if WezTerm is the foreground window at inject time.
+   Otherwise leave the transcript on the clipboard for a manual `Ctrl+Shift+V` and skip
+   injection. This makes wrong-target insertion impossible.
 5. **Elevation:** run **non-elevated**, matching WezTerm's integrity level, or
    `SendInput` will not reach it.
 
@@ -105,9 +119,9 @@ Wispr dictation
   → poll finds a NEW, FINALIZED, wezterm-targeted row (timestamp > high-water mark,
     id not already processed)
   → is WezTerm the foreground window?
-       yes → save current clipboard → set clipboard = transcript → SendInput Ctrl+Shift+V
-             → (after short delay) restore previous clipboard
-       no  → leave transcript on clipboard, skip paste
+       yes → strip control chars → inject the transcript as a paced bracketed paste
+             (ESC[200~ text ESC[201~ via SendInput; no clipboard involved)
+       no  → leave transcript on clipboard, skip injection
   → advance high-water mark, record processed id
   → log outcome
 ```
@@ -130,9 +144,10 @@ Wispr dictation
   WhisperWez must work correctly on text-readiness alone if `status` proves
   ambiguous.
 - **Injector** — foreground-window check (`GetForegroundWindow` +
-  `GetWindowThreadProcessId` → process name compared to `TargetApp`),
-  `Set-Clipboard`, `Ctrl+Shift+V` via `SendInput` (P/Invoke: Ctrl down, Shift down,
-  V down, V up, Shift up, Ctrl up), then optional clipboard restore.
+  `GetWindowThreadProcessId` → process name compared to `TargetApp`); when focused,
+  strip control chars and inject the transcript as a paced bracketed paste via `SendInput`
+  (`ESC[200~ text ESC[201~`, one key event at a time with a `PasteDelayMs` pause). When not
+  focused, fall back to `Set-Clipboard` only (manual paste). No clipboard on the injected path.
 - **Logger** — appends timestamped lines to a rolling log file.
 
 ## Error handling

@@ -12,14 +12,11 @@ Describe 'Get-WhisperWezVersion' {
 Describe 'Get-WhisperWezConfig' {
     It 'provides expected defaults' {
         $c = Get-WhisperWezConfig
-        $c.TargetApp              | Should -Be 'wezterm-gui'
-        $c.PollMs                 | Should -Be 400
-        $c.RestoreClipboard       | Should -BeFalse
-        $c.MaxRecentIds           | Should -Be 50
-        $c.ClipboardRestoreDelayMs| Should -Be 300
-        $c.ClipboardSettleMs      | Should -Be 1500
-        $c.ClipboardStableMs      | Should -Be 200
-        $c.DbPath                 | Should -Match 'flow\.sqlite$'
+        $c.TargetApp | Should -Be 'wezterm-gui'
+        $c.PollMs    | Should -Be 400
+        $c.PasteDelayMs | Should -Be 20
+        $c.MaxRecentIds | Should -Be 50
+        $c.DbPath    | Should -Match 'flow\.sqlite$'
     }
     It 'applies overrides' {
         $c = Get-WhisperWezConfig -Overrides @{ PollMs = 100; TargetApp = 'x' }
@@ -256,9 +253,16 @@ Describe 'Get-ForegroundProcessName (smoke)' {
 
 Describe 'Clipboard primitives' {
     It 'round-trips clipboard text' {
+        # The clipboard is a shared OS resource: Wispr Flow (or a running WhisperWez instance
+        # doing a clipboard-only write) can momentarily hold it, so a single set/read flakes.
+        # Retry briefly to ride out transient contention; a persistent failure is a real problem.
         $marker = 'WW_TEST_' + [guid]::NewGuid()
-        (Set-ClipboardTextSafe -Text $marker) | Should -BeTrue
-        Get-ClipboardTextSafe | Should -Be $marker
+        $ok = $false
+        foreach ($i in 1..20) {
+            if ((Set-ClipboardTextSafe -Text $marker) -and (Get-ClipboardTextSafe) -eq $marker) { $ok = $true; break }
+            Start-Sleep -Milliseconds 50
+        }
+        $ok | Should -BeTrue
     }
     It 'Set-ClipboardTextSafe handles empty string' {
         (Set-ClipboardTextSafe -Text '') | Should -BeTrue
@@ -268,59 +272,63 @@ Describe 'Clipboard primitives' {
 Describe 'SendInput INPUT struct ABI size' {
     It 'INPUT marshals to the native size for this architecture' {
         $expected = if ([Environment]::Is64BitProcess) { 40 } else { 28 }
-        [WWPaste]::InputStructSize() | Should -Be $expected
+        $type = Get-InjectType
+        $type::InputStructSize() | Should -Be $expected
+    }
+}
+
+Describe 'ConvertTo-InjectableText' {
+    It 'passes ordinary printable text through unchanged' {
+        ConvertTo-InjectableText -Text 'Hello, world! 123' | Should -Be 'Hello, world! 123'
+    }
+    It 'strips newlines and carriage returns (no accidental Enter)' {
+        ConvertTo-InjectableText -Text "line1`r`nline2`n" | Should -Be 'line1line2'
+    }
+    It 'strips tabs and other C0 control characters and DEL' {
+        # Build control chars via [char] so this works on PowerShell 5.1 (the `u{..} escape is 7+).
+        $s = "a`tb" + [char]0x07 + 'c' + [char]0x7F + 'd'   # tab, BEL, DEL
+        ConvertTo-InjectableText -Text $s | Should -Be 'abcd'
+    }
+    It 'keeps accented characters and emoji' {
+        ConvertTo-InjectableText -Text "café 🎤" | Should -Be "café 🎤"
+    }
+    It 'returns empty for empty input' {
+        ConvertTo-InjectableText -Text '' | Should -Be ''
     }
 }
 
 Describe 'Invoke-Injection' {
     BeforeEach {
-        $script:cfg = Get-WhisperWezConfig -Overrides @{ RestoreClipboard = $true; ClipboardRestoreDelayMs = 0; ClipboardStableMs = 0 }
+        $script:cfg = Get-WhisperWezConfig
         Mock -ModuleName WhisperWez Set-ClipboardTextSafe { $true }
-        Mock -ModuleName WhisperWez Send-PasteChord {}
-        Mock -ModuleName WhisperWez Start-Sleep {}
-        Mock -ModuleName WhisperWez Write-WhisperWezLog {}
+        Mock -ModuleName WhisperWez Send-BracketedPaste {}
     }
-    It 'pastes and restores when WezTerm is focused' {
+    It 'bracketed-pastes the transcript (no clipboard) when WezTerm is focused' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $true }
-        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'hello' }  # clipboard holds our text from the first read
         $r = Invoke-Injection -Text 'hello' -Config $script:cfg
         $r.Action  | Should -Be 'pasted'
         $r.Focused | Should -BeTrue
-        Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 1 -Exactly
-        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 2 -Exactly  # initial set, then restore (no drift)
+        Should -Invoke -ModuleName WhisperWez Send-BracketedPaste -Times 1 -Exactly -ParameterFilter { $Text -eq 'hello' }
+        Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 0 -Exactly  # focused path never touches the clipboard
     }
-    It 'waits out contention and re-asserts when Wispr clobbers the clipboard before paste' {
+    It 'strips newlines/tabs before injecting so nothing auto-executes' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $true }
-        # First read comes back empty (Wispr still holds it); after our re-assert it holds our text.
-        $global:wwReads = 0
-        Mock -ModuleName WhisperWez Get-ClipboardTextSafe {
-            $global:wwReads++
-            if ($global:wwReads -eq 1) { '' } else { 'hello' }
-        }
-        try {
-            $r = Invoke-Injection -Text 'hello' -Config (Get-WhisperWezConfig -Overrides @{ RestoreClipboard = $false; ClipboardStableMs = 0 })
-            $r.Action | Should -Be 'pasted'
-            Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 2 -Exactly  # initial set + one re-assert
-            Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 1 -Exactly
-            Should -Invoke -ModuleName WhisperWez Write-WhisperWezLog -Times 1 -Exactly    # settle summary logged
-        } finally {
-            Remove-Variable -Name wwReads -Scope Global -ErrorAction SilentlyContinue
-        }
+        $r = Invoke-Injection -Text "ls`r`n-la`ttab" -Config $script:cfg
+        $r.Action | Should -Be 'pasted'
+        Should -Invoke -ModuleName WhisperWez Send-BracketedPaste -Times 1 -Exactly -ParameterFilter { $Text -eq 'ls-latab' }
     }
-    It 'sets clipboard only when not focused' {
+    It 'sets clipboard only (no injection) when not focused' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $false }
-        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'PREV' }
         $r = Invoke-Injection -Text 'hello' -Config $script:cfg
         $r.Action | Should -Be 'clipboard-only'
-        Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 0 -Exactly
+        Should -Invoke -ModuleName WhisperWez Send-BracketedPaste -Times 0 -Exactly
         Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 1 -Exactly
     }
     It 'does nothing to the OS in DryRun' {
         Mock -ModuleName WhisperWez Test-TargetFocused { $true }
-        Mock -ModuleName WhisperWez Get-ClipboardTextSafe { 'PREV' }
         $r = Invoke-Injection -Text 'hello' -Config $script:cfg -DryRun
         $r.Action | Should -Be 'dryrun'
-        Should -Invoke -ModuleName WhisperWez Send-PasteChord -Times 0 -Exactly
+        Should -Invoke -ModuleName WhisperWez Send-BracketedPaste -Times 0 -Exactly
         Should -Invoke -ModuleName WhisperWez Set-ClipboardTextSafe -Times 0 -Exactly
     }
 }

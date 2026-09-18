@@ -21,17 +21,14 @@ function Get-WhisperWezConfig {
     param([hashtable]$Overrides = @{})
     $root = $PSScriptRoot
     $config = @{
-        DbPath                  = Join-Path $env:APPDATA 'Wispr Flow\flow.sqlite'
-        TargetApp               = 'wezterm-gui'
-        PollMs                  = 400
-        RestoreClipboard        = $false
-        ClipboardRestoreDelayMs = 300
-        ClipboardSettleMs       = 1500  # max time to wait for Wispr to release the clipboard before pasting
-        ClipboardStableMs       = 200   # our text must hold unchanged this long (Wispr done) before we paste
-        MaxRecentIds            = 50
-        StateFile               = Join-Path $root 'state.json'
-        LogFile                 = Join-Path $root 'whisperwez.log'
-        Sqlite3Path             = $null   # resolved lazily by the runner to keep this pure/testable
+        DbPath       = Join-Path $env:APPDATA 'Wispr Flow\flow.sqlite'
+        TargetApp    = 'wezterm-gui'
+        PollMs       = 400
+        PasteDelayMs = 20   # per-byte pause during bracketed paste; higher = safer against char drops, slower
+        MaxRecentIds = 50
+        StateFile    = Join-Path $root 'state.json'
+        LogFile      = Join-Path $root 'whisperwez.log'
+        Sqlite3Path  = $null   # resolved lazily by the runner to keep this pure/testable
     }
     foreach ($k in $Overrides.Keys) { $config[$k] = $Overrides[$k] }
     $config
@@ -229,7 +226,8 @@ function Set-ClipboardTextSafe {
 $script:SendInput = @'
 using System;
 using System.Runtime.InteropServices;
-public static class WWPaste {
+using System.Threading;
+public static class __WWINJECT__ {
     [StructLayout(LayoutKind.Sequential)]
     struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [StructLayout(LayoutKind.Sequential)]
@@ -242,30 +240,91 @@ public static class WWPaste {
     struct INPUT { public uint type; public InputUnion U; }
     [DllImport("user32.dll", SetLastError=true)]
     static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-    const uint INPUT_KEYBOARD = 1; const uint KEYEVENTF_KEYUP = 2;
-    const ushort VK_CONTROL = 0x11; const ushort VK_SHIFT = 0x10; const ushort VK_V = 0x56;
-    static INPUT Key(ushort vk, bool up) {
-        return new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0 } } };
+    const uint INPUT_KEYBOARD = 1; const uint KEYEVENTF_KEYUP = 2; const uint KEYEVENTF_UNICODE = 4;
+    const ushort VK_ESCAPE = 0x1B;
+    // A Unicode "key" carries the UTF-16 code unit in wScan with wVk=0, so the character is
+    // delivered literally regardless of keyboard layout. Surrogate pairs (e.g. emoji) work
+    // because each half is its own code unit, sent as consecutive events.
+    static INPUT UniKey(ushort codeUnit, bool up) {
+        return new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT {
+            wVk = 0, wScan = codeUnit,
+            dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0) } } };
+    }
+    // A real virtual key (by VK code). Used for ESC: KEYEVENTF_UNICODE won't reliably deliver a
+    // C0 control byte, but VK_ESCAPE presses send a genuine 0x1B to the terminal.
+    static INPUT VkKey(ushort vk, bool up) {
+        return new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT {
+            wVk = vk, wScan = 0, dwFlags = (up ? KEYEVENTF_KEYUP : 0) } } };
     }
     public static int InputStructSize() { return Marshal.SizeOf(typeof(INPUT)); }
-    // WezTerm's default paste binding is Ctrl+Shift+V. Plain Ctrl+V is NOT paste in WezTerm --
-    // it passes through to the WSL shell where readline treats it as quoted-insert -- so the
-    // Shift is required for the transcript to actually paste.
-    public static uint CtrlShiftV() {
-        INPUT[] seq = new INPUT[] {
-            Key(VK_CONTROL,false), Key(VK_SHIFT,false), Key(VK_V,false),
-            Key(VK_V,true), Key(VK_SHIFT,true), Key(VK_CONTROL,true) };
-        return SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT)));
+    // Sends one key event pair (down+up) then pauses. Pacing matters: Claude Code drops
+    // characters when input arrives in one fast burst.
+    static uint SendOne(INPUT down, INPUT up, int delayMs) {
+        INPUT[] pair = new INPUT[] { down, up };
+        uint n = SendInput(2, pair, Marshal.SizeOf(typeof(INPUT)));
+        if (delayMs > 0) Thread.Sleep(delayMs);
+        return n;
+    }
+    // Delivers the text as a terminal BRACKETED PASTE -- ESC[200~ <text> ESC[201~ -- one byte at
+    // a time with a pause between each. The markers put the TUI (bash readline, Claude Code, ...)
+    // into paste-buffer mode: it accumulates the bytes as pasted content instead of processing
+    // them as keystrokes, so they can't interleave with its render/escape-sequence traffic (which
+    // corrupted per-character typing with stray chars). Pacing stops the character drops seen when
+    // the whole thing is sent as one burst. The text is inline in the byte stream -- no clipboard --
+    // so it also avoids the stale-clipboard paste bug. ESC is a real VK_ESCAPE key; the rest Unicode.
+    public static uint PasteText(string text, int perCharDelayMs) {
+        if (text == null) text = "";
+        uint total = 0;
+        total += SendOne(VkKey(VK_ESCAPE, false), VkKey(VK_ESCAPE, true), perCharDelayMs);
+        foreach (char c in "[200~") total += SendOne(UniKey((ushort)c, false), UniKey((ushort)c, true), perCharDelayMs);
+        foreach (char c in text)    total += SendOne(UniKey((ushort)c, false), UniKey((ushort)c, true), perCharDelayMs);
+        total += SendOne(VkKey(VK_ESCAPE, false), VkKey(VK_ESCAPE, true), perCharDelayMs);
+        foreach (char c in "[201~") total += SendOne(UniKey((ushort)c, false), UniKey((ushort)c, true), perCharDelayMs);
+        return total;
     }
 }
 '@
-if (-not ('WWPaste' -as [type])) { Add-Type -TypeDefinition $script:SendInput }
+# Compile the helper under a name derived from a hash of its own source. A compiled .NET type
+# cannot be redefined under the same name within one process, so editing this C# and re-running
+# in a REUSED PowerShell session used to leave the old type loaded (symptom: 'Cannot find an
+# overload' errors after a method signature changed). Hashing the source means any change yields a new type name that
+# always compiles fresh, while a brand-new process simply compiles it once. String.GetHashCode
+# (masked non-negative) is deterministic within a process and avoids crypto APIs that can throw
+# on FIPS-locked machines; it only needs to be stable within a process, which it is.
+$script:InjectTypeName = 'WWInject_' + ($script:SendInput.GetHashCode() -band 0x7FFFFFFF).ToString('x')
+if (-not ($script:InjectTypeName -as [type])) {
+    Add-Type -TypeDefinition ($script:SendInput -replace '__WWINJECT__', $script:InjectTypeName)
+}
+$script:InjectType = $script:InjectTypeName -as [type]
 
-function Send-PasteChord {
+function Get-InjectType {
+    # The compiled SendInput helper type (its name is source-hashed; see above). Exposed so
+    # callers and tests reference the current type without hardcoding the hashed name.
     [CmdletBinding()]
     param()
-    $sent = [WWPaste]::CtrlShiftV()
-    if ($sent -ne 6) { throw "SendInput injected $sent of 6 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
+    $script:InjectType
+}
+
+function ConvertTo-InjectableText {
+    # Strip control characters before typing. The critical one is newline (\r/\n): typed
+    # directly (there is no bracketed-paste wrapper) it acts as Enter and could run a command
+    # -- exactly the auto-execute risk the design forbids. Tabs and other C0 controls (and DEL)
+    # are removed too; ordinary printable text, accents and emoji pass through untouched.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    ($Text.ToCharArray() | Where-Object { [int]$_ -ge 32 -and [int]$_ -ne 127 }) -join ''
+}
+
+function Send-BracketedPaste {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [int]$DelayMs = 20   # per-byte pause; paces the paste so Claude Code doesn't drop characters
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return }
+    $type = $script:InjectType
+    $sent = $type::PasteText($Text, $DelayMs)
+    if ($sent -eq 0) { throw "SendInput injected 0 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
 }
 
 function Invoke-Injection {
@@ -282,48 +341,19 @@ function Invoke-Injection {
     }
 
     if (-not $focused) {
+        # WezTerm isn't focused, so we must not type into whatever is. Leave the transcript on
+        # the clipboard for a manual Ctrl+Shift+V and skip injection (the focus guard).
         [void](Set-ClipboardTextSafe -Text $Text)
         return [pscustomobject]@{ Action = 'clipboard-only'; Focused = $false }
     }
 
-    $prev = if ($Config.RestoreClipboard) { Get-ClipboardTextSafe } else { $null }
-
-    # Wispr Flow manipulates the clipboard around each dictation (copies the transcript,
-    # attempts its own insert, then clears/restores) and can keep it locked or empty for a
-    # few hundred ms AFTER the DB row is finalized -- during that window our own Set/Get come
-    # back empty (observed: three reads at len=0), and pasting into it yields empty or stale
-    # text. So don't race: assert our text, then wait until it has HELD unchanged for a short
-    # stability window (proof Wispr has finished touching the clipboard), re-asserting on any
-    # drift, and only then paste. Bounded by ClipboardSettleMs so a stuck clipboard can't hang
-    # the loop.
-    [void](Set-ClipboardTextSafe -Text $Text)
-    $deadline    = [DateTime]::UtcNow.AddMilliseconds([int]$Config.ClipboardSettleMs)
-    $stableSince = $null
-    $reasserts   = 0
-    $stable      = $false
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if ((Get-ClipboardTextSafe) -eq $Text) {
-            if ($null -eq $stableSince) { $stableSince = [DateTime]::UtcNow }
-            elseif (([DateTime]::UtcNow - $stableSince).TotalMilliseconds -ge [int]$Config.ClipboardStableMs) {
-                $stable = $true; break
-            }
-        } else {
-            [void](Set-ClipboardTextSafe -Text $Text)   # Wispr clobbered it -- put our text back
-            $stableSince = $null
-            $reasserts++
-        }
-        Start-Sleep -Milliseconds 30
-    }
-    if ($reasserts -gt 0 -or -not $stable) {
-        Write-WhisperWezLog -LogFile $Config.LogFile -Level ($(if ($stable) { 'INFO' } else { 'WARN' })) `
-            -Message ("clipboard settle: stable={0} reasserts={1} (Wispr clipboard contention)" -f $stable, $reasserts)
-    }
-
-    Send-PasteChord
-    if ($Config.RestoreClipboard) {
-        Start-Sleep -Milliseconds $Config.ClipboardRestoreDelayMs
-        [void](Set-ClipboardTextSafe -Text $prev)
-    }
+    # Inject the transcript as a terminal bracketed paste (see Send-BracketedPaste) -- one block,
+    # inline in the byte stream. No clipboard (so nothing for Wispr's clipboard save/restore to
+    # race), and not a keystroke stream (so it can't interleave with a TUI's escape-sequence
+    # traffic the way per-character typing did). Strip control chars first so a stray newline
+    # can't act as Enter and run a command.
+    $injectable = ConvertTo-InjectableText -Text $Text
+    Send-BracketedPaste -Text $injectable -DelayMs $Config.PasteDelayMs
     [pscustomobject]@{ Action = 'pasted'; Focused = $true }
 }
 
