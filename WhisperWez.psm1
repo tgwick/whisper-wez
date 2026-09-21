@@ -244,6 +244,12 @@ public static class __WWINJECT__ {
     static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     const uint INPUT_KEYBOARD = 1; const uint KEYEVENTF_KEYUP = 2; const uint KEYEVENTF_UNICODE = 4;
     const ushort VK_ESCAPE = 0x1B;
+    // Modifiers we defensively release before injecting the real ESC (see PasteText). If another
+    // process (e.g. Wispr Flow, mid-Ctrl+V auto-paste) is holding Ctrl when our ESC lands, Windows
+    // reads it as Ctrl+Esc and opens the Start menu; the same guards Alt/Shift/Win for good measure.
+    const ushort VK_SHIFT = 0x10; const ushort VK_CONTROL = 0x11; const ushort VK_MENU = 0x12;
+    const ushort VK_LWIN = 0x5B; const ushort VK_RWIN = 0x5C;
+    static readonly ushort[] MODIFIERS = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN };
     // A Unicode "key" carries the UTF-16 code unit in wScan with wVk=0, so the character is
     // delivered literally regardless of keyboard layout. Surrogate pairs (e.g. emoji) work
     // because each half is its own code unit, sent as consecutive events.
@@ -276,7 +282,11 @@ public static class __WWINJECT__ {
         if (text == null) text = "";
         if (chunkChars < 1) chunkChars = 1;
         // Build the full event stream: ESC [200~ <text> ESC [201~, each char as a down+up pair.
-        List<INPUT> events = new List<INPUT>((text.Length + 12) * 2);
+        List<INPUT> events = new List<INPUT>((text.Length + MODIFIERS.Length + 12) * 2);
+        // Release any modifier a foreground app might be holding (notably Ctrl during Wispr's Ctrl+V)
+        // so our genuine VK_ESCAPE below can't combine into Ctrl+Esc and pop the Start menu. A key-up
+        // for a key that is already up is a harmless no-op, so this is inert on a normal paste.
+        foreach (ushort vk in MODIFIERS) events.Add(VkKey(vk, true));
         events.Add(VkKey(VK_ESCAPE, false)); events.Add(VkKey(VK_ESCAPE, true));
         foreach (char c in "[200~") { events.Add(UniKey((ushort)c, false)); events.Add(UniKey((ushort)c, true)); }
         foreach (char c in text)    { events.Add(UniKey((ushort)c, false)); events.Add(UniKey((ushort)c, true)); }
