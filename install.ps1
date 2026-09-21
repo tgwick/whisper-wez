@@ -30,6 +30,11 @@ $arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ru
 
 $action    = New-ScheduledTaskAction -Execute $psExe -Argument $arguments -WorkingDirectory $scriptDir
 $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Delay the launch 60s after logon. At logon the interactive session and its dependencies
+# (the desktop, and what sqlite3.exe needs to initialize) aren't fully up yet; starting too
+# early makes the first flow.sqlite poll fail (STATUS_DLL_INIT_FAILED) and the process dies
+# on startup. A one-minute delay lets the session settle before the first poll.
+$trigger.Delay = 'PT1M'
 # Interactive + Limited: run in the logged-on desktop session, non-elevated, so SendInput reaches WezTerm.
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 # Keep it resilient: start on/keep running on battery, start if a logon was missed, never time out.
