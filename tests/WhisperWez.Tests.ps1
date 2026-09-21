@@ -15,6 +15,7 @@ Describe 'Get-WhisperWezConfig' {
         $c.TargetApp | Should -Be 'wezterm-gui'
         $c.PollMs    | Should -Be 400
         $c.PasteDelayMs | Should -Be 20
+        $c.PasteChunkChars | Should -Be 40
         $c.MaxRecentIds | Should -Be 50
         $c.DbPath    | Should -Match 'flow\.sqlite$'
     }

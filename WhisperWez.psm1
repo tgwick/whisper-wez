@@ -24,7 +24,8 @@ function Get-WhisperWezConfig {
         DbPath       = Join-Path $env:APPDATA 'Wispr Flow\flow.sqlite'
         TargetApp    = 'wezterm-gui'
         PollMs       = 400
-        PasteDelayMs = 20   # per-byte pause during bracketed paste; higher = safer against char drops, slower
+        PasteChunkChars = 40  # characters sent per SendInput batch during bracketed paste
+        PasteDelayMs = 20   # pause between batches (ms); higher = safer against char drops, slower
         MaxRecentIds = 50
         StateFile    = Join-Path $root 'state.json'
         LogFile      = Join-Path $root 'whisperwez.log'
@@ -225,6 +226,7 @@ function Set-ClipboardTextSafe {
 
 $script:SendInput = @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 public static class __WWINJECT__ {
@@ -257,29 +259,41 @@ public static class __WWINJECT__ {
             wVk = vk, wScan = 0, dwFlags = (up ? KEYEVENTF_KEYUP : 0) } } };
     }
     public static int InputStructSize() { return Marshal.SizeOf(typeof(INPUT)); }
-    // Sends one key event pair (down+up) then pauses. Pacing matters: Claude Code drops
-    // characters when input arrives in one fast burst.
-    static uint SendOne(INPUT down, INPUT up, int delayMs) {
-        INPUT[] pair = new INPUT[] { down, up };
-        uint n = SendInput(2, pair, Marshal.SizeOf(typeof(INPUT)));
-        if (delayMs > 0) Thread.Sleep(delayMs);
-        return n;
-    }
-    // Delivers the text as a terminal BRACKETED PASTE -- ESC[200~ <text> ESC[201~ -- one byte at
-    // a time with a pause between each. The markers put the TUI (bash readline, Claude Code, ...)
-    // into paste-buffer mode: it accumulates the bytes as pasted content instead of processing
-    // them as keystrokes, so they can't interleave with its render/escape-sequence traffic (which
-    // corrupted per-character typing with stray chars). Pacing stops the character drops seen when
-    // the whole thing is sent as one burst. The text is inline in the byte stream -- no clipboard --
-    // so it also avoids the stale-clipboard paste bug. ESC is a real VK_ESCAPE key; the rest Unicode.
-    public static uint PasteText(string text, int perCharDelayMs) {
+    // Delivers the text as a terminal BRACKETED PASTE -- ESC[200~ <text> ESC[201~. The markers put
+    // the TUI (bash readline, Claude Code, ...) into paste-buffer mode: it accumulates the bytes as
+    // pasted content instead of processing them as keystrokes, so they can't interleave with its
+    // render/escape-sequence traffic (which corrupted per-character typing with stray chars). The
+    // text is inline in the byte stream -- no clipboard -- so it also avoids the stale-clipboard
+    // paste bug. ESC is a real VK_ESCAPE key; the rest Unicode.
+    //
+    // Pacing: the events are sent in batches of `chunkChars` characters per SendInput call, with a
+    // `chunkDelayMs` pause between batches. This keeps the Windows input queue from being flooded
+    // (the original cause of dropped characters) WITHOUT the old per-character sleep, which made a
+    // long transcript take chars*delay ms to paste. Because bracketed paste buffers the bytes rather
+    // than interpreting each as a keystroke, per-batch pacing is enough. Smaller chunkChars / larger
+    // chunkDelayMs = safer against drops but slower; larger chunkChars / 0 delay = fastest.
+    public static uint PasteText(string text, int chunkChars, int chunkDelayMs) {
         if (text == null) text = "";
+        if (chunkChars < 1) chunkChars = 1;
+        // Build the full event stream: ESC [200~ <text> ESC [201~, each char as a down+up pair.
+        List<INPUT> events = new List<INPUT>((text.Length + 12) * 2);
+        events.Add(VkKey(VK_ESCAPE, false)); events.Add(VkKey(VK_ESCAPE, true));
+        foreach (char c in "[200~") { events.Add(UniKey((ushort)c, false)); events.Add(UniKey((ushort)c, true)); }
+        foreach (char c in text)    { events.Add(UniKey((ushort)c, false)); events.Add(UniKey((ushort)c, true)); }
+        events.Add(VkKey(VK_ESCAPE, false)); events.Add(VkKey(VK_ESCAPE, true));
+        foreach (char c in "[201~") { events.Add(UniKey((ushort)c, false)); events.Add(UniKey((ushort)c, true)); }
+
+        INPUT[] all = events.ToArray();
+        int structSize = Marshal.SizeOf(typeof(INPUT));
+        int batchEvents = chunkChars * 2;   // two events (down+up) per character
         uint total = 0;
-        total += SendOne(VkKey(VK_ESCAPE, false), VkKey(VK_ESCAPE, true), perCharDelayMs);
-        foreach (char c in "[200~") total += SendOne(UniKey((ushort)c, false), UniKey((ushort)c, true), perCharDelayMs);
-        foreach (char c in text)    total += SendOne(UniKey((ushort)c, false), UniKey((ushort)c, true), perCharDelayMs);
-        total += SendOne(VkKey(VK_ESCAPE, false), VkKey(VK_ESCAPE, true), perCharDelayMs);
-        foreach (char c in "[201~") total += SendOne(UniKey((ushort)c, false), UniKey((ushort)c, true), perCharDelayMs);
+        for (int i = 0; i < all.Length; i += batchEvents) {
+            int n = Math.Min(batchEvents, all.Length - i);
+            INPUT[] batch = new INPUT[n];
+            Array.Copy(all, i, batch, 0, n);
+            total += SendInput((uint)n, batch, structSize);
+            if (chunkDelayMs > 0 && i + n < all.Length) Thread.Sleep(chunkDelayMs);
+        }
         return total;
     }
 }
@@ -319,11 +333,12 @@ function Send-BracketedPaste {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
-        [int]$DelayMs = 20   # per-byte pause; paces the paste so Claude Code doesn't drop characters
+        [int]$ChunkChars = 40,  # characters per SendInput batch
+        [int]$DelayMs = 20      # pause between batches; paces the paste so Claude Code doesn't drop characters
     )
     if ([string]::IsNullOrEmpty($Text)) { return }
     $type = $script:InjectType
-    $sent = $type::PasteText($Text, $DelayMs)
+    $sent = $type::PasteText($Text, $ChunkChars, $DelayMs)
     if ($sent -eq 0) { throw "SendInput injected 0 events (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
 }
 
@@ -353,7 +368,7 @@ function Invoke-Injection {
     # traffic the way per-character typing did). Strip control chars first so a stray newline
     # can't act as Enter and run a command.
     $injectable = ConvertTo-InjectableText -Text $Text
-    Send-BracketedPaste -Text $injectable -DelayMs $Config.PasteDelayMs
+    Send-BracketedPaste -Text $injectable -ChunkChars $Config.PasteChunkChars -DelayMs $Config.PasteDelayMs
     [pscustomobject]@{ Action = 'pasted'; Focused = $true }
 }
 

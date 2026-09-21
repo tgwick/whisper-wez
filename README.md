@@ -86,8 +86,11 @@ Config lives in `Get-WhisperWezConfig` (`WhisperWez.psm1`); a couple are also ru
 
 - `-DryRun` — log what would be injected without touching the keyboard.
 - `-Once` — run a single poll and exit.
-- `-PasteDelayMs <n>` — per-byte pause during the paste (default 20). Raise it if a long
-  transcript ever drops characters; lower it to paste faster.
+- `-PasteDelayMs <n>` — pause (ms) between paste batches (default 20). Raise it if a long
+  transcript ever drops characters; lower it (or 0) to paste faster.
+- `-PasteChunkChars <n>` — characters sent per batch (default 40). Larger = faster; smaller
+  = safer against dropped characters. The paste is now batched, so a long transcript pastes
+  in well under a second instead of char-by-char.
 
 ## Troubleshooting
 
@@ -95,9 +98,10 @@ Config lives in `Get-WhisperWezConfig` (`WhisperWez.psm1`); a couple are also ru
   `whisperwez.log` for `typed`/`pasted` vs `clipboard-only (focused=False)`.
 - **A stale/old value appears before your text** — the WezTerm `Ctrl+V` step (above) is
   missing or not reloaded.
-- **Dropped characters in a long paste** — raise `-PasteDelayMs` (e.g. 35).
-- **Delay before text appears** — mostly Wispr's own formatting time; `PollMs` and
-  `PasteDelayMs` are the parts you can tune.
+- **Dropped characters in a long paste** — lower `-PasteChunkChars` (e.g. 20) and/or raise
+  `-PasteDelayMs` (e.g. 35).
+- **Delay before text appears** — mostly Wispr's own formatting time; `PollMs`,
+  `PasteChunkChars` and `PasteDelayMs` are the parts you can tune.
 
 ## Tests
 
