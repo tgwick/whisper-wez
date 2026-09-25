@@ -41,6 +41,9 @@ cd D:\Git\Personal\WhisperWez
 .\whisperwez.ps1
 ```
 
+Or just double-click **`Start WhisperWez.cmd`** — it starts the scheduled task if installed,
+otherwise launches the script hidden. Safe to click when it's already running.
+
 Then dictate into WezTerm/Claude Code — the transcript is injected when WezTerm is focused.
 If it isn't focused, the text is left on the clipboard for a manual `Ctrl+Shift+V`.
 
